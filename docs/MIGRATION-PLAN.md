@@ -760,3 +760,4 @@ docker compose pull && docker compose up -d   # 镜像 tag 改回 1.2.1
 | 2026-10-25 | v1.3 | 执行用户与组改由 compose `user:` 指定（镜像 `USER` 仅兜底），镜像内权限位适配任意 UID，补充 compose 示例与 UID 对齐校验 |
 | 2026-10-25 | v1.4 | 按实际部署 compose（`scdm/ssh-honeypot-j`、bind mount、未挂 config.yaml、Web 12186、AI 环境变量）校准升级对照与完整示例；补充不依赖 `os/user` 的实现约束 |
 | 2026-10-25 | v1.5 | 固定部署身份为 `10001:10001`（路线 B）：compose、chown、验收与门禁全部对齐；CI 改用 `12345:12345` 验证身份可覆盖 |
+| 2026-10-25 | v1.6 | M7 落地：新增 `cmd/conformance`（`db-diff` 库结构差分 + `api-diff` HTTP 契约差分，均为 Go 实现，带单测）；Gitea 工作流补齐 `verify-code`（gofmt/vet/test -race）并支持 PR 触发；`README` 补充升级/回滚、AI、差分与安全基线 |

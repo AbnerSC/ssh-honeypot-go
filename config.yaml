@@ -1,0 +1,104 @@
+# SSH/Telnet/数据库蜜罐配置文件
+
+# 伪装主机名（Shell 提示符、uname/hostname/env、/etc/hostname 等处展示）
+# 优先级：Docker 容器主机名（docker run --hostname / compose hostname）> 此处配置 > 默认值 svr01
+# 注：Docker 未显式设置 hostname 时容器主机名为随机容器 ID，该情况自动忽略并回退到此处配置
+hostname: ubuntu
+
+ssh:
+  enabled: true      # 是否启用 SSH 服务
+  port: 2222         # SSH 监听端口
+
+telnet:
+  enabled: true      # 是否启用 Telnet 服务
+  port: 2323         # Telnet 监听端口
+
+# 数据库蜜罐：均先通过协议交互捕获登录凭证（账号/密码）记录后再返回认证失败；均有最大并发连接限制防资源耗尽
+mysql:
+  enabled: true      # 是否启用 MySQL 蜜罐（模拟 8.4，握手捕获账号密码并记录后返回 Access denied 1045/28000；最大并发连接 20，超限返回 Too many connections 1040）
+  port: 3306         # MySQL 监听端口
+
+postgresql:
+  enabled: true      # 是否启用 PostgreSQL 蜜罐（模拟 17，捕获账号明文密码并记录后返回 FATAL 28P01 认证失败；最大并发连接 20，超限返回 53300）
+  port: 5432         # PostgreSQL 监听端口
+
+redis:
+  enabled: true      # 是否启用 Redis 蜜罐（模拟 7，捕获 AUTH 账号明文密码并记录后返回 WRONGPASS；最大并发连接 20，超限返回 max number of clients reached）
+  port: 6379         # Redis 监听端口
+
+log:
+  file: logs/honeypot.jsonl   # 攻击日志文件路径
+  db: db/database.db        # SQLite 数据库文件（与 JSONL 双写同一份数据，供 Web 可视化）
+  ipdb_v4: db/ip2region_v4.xdb  # IP 归属地离线库文件（ip2region xdb 格式 ipv4），解析来源 IP 为“国家 省份 城市”；
+  ipdb_v6: db/ip2region_v6.xdb  # IP 归属地离线库文件（ip2region xdb 格式 ipv6），解析来源 IP 为“国家 省份 城市”；
+                            # 可选覆盖项：文件缺失时自动回退使用内置库（已随二进制打包），均缺失时归属地留空，不影响其他功能
+
+# 大模型命令仿真：伪 Shell 内置命令表未命中的未知命令（如 ./malware、nmap 等自定义工具）
+# 交给大模型生成仿真终端输出，避免千篇一律的 command not found 被识破；
+# 未启用/未配置或服务不可用（超时/限流/熔断）时自动降级：未知命令一律返回本地 "-bash: xxx: command not found"
+# Docker/compose 部署推荐用环境变量注入（AI_ENABLED / AI_BASE_URL / AI_API_KEY / AI_MODEL_NAME 等，
+# 优先级高于本文件，见 README），免挂载配置文件；默认关闭，不配置大模型服务开箱即用
+ai:
+  enabled: false     # 是否启用大模型命令仿真（false 时未知命令完全走本地 command not found）
+  base_url: ""       # 大模型服务地址（OpenAI 兼容接口，自动补全 /v1 后缀），如 http://127.0.0.1:8000
+  api_key: ""        # 大模型服务 API 密钥（本地无鉴权服务可留空）
+  model_name: ""     # 大模型服务模型名称，如 qwen3-2b
+  enable_thinking: false  # 是否开启模型思考模式（混合推理模型经 chat_template_kwargs 透传；开启后响应更慢，建议同步调大 timeout_seconds）
+  timeout_seconds: 20     # 单次请求超时（秒），超时立即降级本地兜底
+  max_output_chars: 8192  # 单条输出最大字符数：超长截断，防长输出撑爆内存
+  max_concurrent: 1       # 全局并发请求上限：超出的命令立即降级不排队，防大模型服务被并发会话打爆
+  failure_threshold: 3    # 连续失败达到该次数后触发熔断
+  cooldown_seconds: 300   # 熔断时长（秒）：期间不再请求大模型，未知命令直接本地兜底
+
+# Web 可视化控制台：攻击日志统计与明细查询、系统用户管理（与蜜罐同进程部署）
+# 首次启动自动创建默认管理员 admin/admin123，登录后强制修改密码
+web:
+  enabled: true            # 是否启用 Web 控制台
+  port: 8080               # Web 监听端口
+  sessionTimeoutMinutes: 30  # 管理端登录会话超时（分钟）
+
+# 登录认证（密码本）配置：仅密码本内的 用户名/密码 允许登录
+# 每个账号可配置多个密码（列表形式），命中任意一个即视为登录成功；
+# 也兼容单个字符串写法，例如：admin: "admin123"
+auth:
+  maxFailures: 3      # 连续登录失败达到该次数后锁定源 IP
+  windowMinutes: 5    # 失败计数窗口：在该时长内的连续失败才累计，超出窗口则重置计数（分钟）
+  lockMinutes: 60     # 源 IP 锁定时长（分钟）
+  credentials:        # 密码本：常见用户名与弱口令，按爆破攻击热度排序
+    # 高频核心管理员账号（全网SSH爆破Top优先级）
+    root: ["123456", "toor", "password", "root123", "root", "12345678", "qwerty", "1q2w3e4r", "1234567890", "admin"]
+    admin: ["admin123", "admin", "administrator", "123456", "password", "admin@123", "Admin@123"]
+    administrator: ["admin123", "123456", "password", "administrator", "Admin@123"]
+    # 主流Linux发行版默认账号
+    ubuntu: ["ubuntu", "123456", "password"]
+    debian: ["debian", "123456", "password"]
+    centos: ["centos", "123456", "password"]
+    fedora: ["fedora", "123456"]
+    pi: ["raspberry", "123456", "pi"]
+    raspberrypi: ["raspberry", "123456"]
+    # 通用测试/访客/普通用户账号
+    test: ["test123", "test", "123456", "password"]
+    user: ["user", "123456", "password", "user123"]
+    guest: ["guest", "123456", "guest123"]
+    default: ["default", "123456"]
+    demo: ["demo", "123456", "demo123"]
+    # 常见数据库与系统服务账号
+    oracle: ["oracle", "123456", "password", "oracle123"]
+    mysql: ["mysql", "123456", "password"]
+    postgres: ["postgres", "123456", "password"]
+    mongodb: ["mongodb", "123456", "password"]
+    redis: ["redis", "123456", "password"]
+    ftp: ["ftp", "123456", "password"]
+    www-data: ["www-data", "123456"]
+    nobody: ["nobody", "123456"]
+    sshd: ["sshd", "123456"]
+    # 运维与开发常用业务账号
+    ops: ["ops123", "123456", "password"]
+    dev: ["dev123", "123456", "password"]
+    deploy: ["deploy", "123456", "deploy123"]
+    git: ["git", "123456", "password"]
+    docker: ["docker", "123456", "password"]
+    support: ["support", "123456", "password"]
+    service: ["service", "123456", "password"]
+    backup: ["backup", "123456", "password"]
+    sync: ["sync", "123456"]

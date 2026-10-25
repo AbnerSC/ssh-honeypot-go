@@ -1,0 +1,253 @@
+# =====================================================================
+# Gitea Actions：Docker 镜像构建并推送到自建 Nexus 仓库
+# （仅 linux/amd64）
+#
+# 与 .github/workflows/docker-image.yml 分工：
+#   - GitHub 侧工作流只会被 GitHub 读取，推送到 Docker Hub
+#   - 本文件只会被 Gitea Actions 读取，推送到自建 Nexus
+#
+# 触发方式：
+#   - 提交 PR 时仅执行代码校验（gofmt / vet / test），不构建镜像
+#   - 推送 main 分支自动构建，仅推送 latest 标签
+#   - 推送 release-v 开头的 tag（如 release-v2.0.0）自动构建，
+#     推送 版本号（2.0.0）+ latest 标签
+#   - 支持在 Actions 页面手动触发（需 Gitea >= 1.21）：
+#     选择 release-v 开头的 tag 时同样推送 版本号 + latest，
+#     选择分支时仅推送 latest
+#
+# 前置条件：
+#   - 仓库 Settings -> vars 中配置：
+#       NEXUS_REGISTRY_DOCKER   Nexus Docker 仓库地址（host[:port][/路径]，如
+#                        nexus.example.com:8082 或 nexus.example.com/repository/docker-releases）
+#       NEXUS_USERNAME   Nexus 账号
+#       NEXUS_PASSWORD   Nexus 密码
+#   - 已注册可用的 act_runner（标签 golang），且 runner 可执行 docker 命令
+#     （代码校验在 Dockerfile.verify 镜像内执行，runner 无需安装 Go）
+#
+# 安全门禁：推送前必须验证镜像默认非 root（USER 10001:10001），
+# 且运行身份可被 compose 的 user: 覆盖，避免容器漏洞影响宿主机。
+# =====================================================================
+name: Docker 镜像构建（Nexus）
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'release-v*'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: ssh-honeypot-j
+  # 自托管 runner 多在国内，注入内部 Go 模块代理加速依赖下载
+  GOPROXY: https://repo.pi.mmxx.fun/repository/go-public,direct
+  # 运行阶段安装 ca-certificates / curl / tzdata 时经公共镜像源加速
+  APT_MIRROR: repo.huaweicloud.com
+  # buildkit（docker-container driver）拉取镜像不走 docker daemon 的 registry-mirrors，
+  # 基础镜像需显式经 Nexus 的 docker 代理仓库拉取，避免 runner 直连 docker.io 超时
+  DOCKER_PROXY: repo.pi.mmxx.fun/docker-public
+
+jobs:
+  # 代码门禁：格式 / 静态检查 / 单测（含 -race），失败则后续镜像步骤不会执行
+  # 与 .github/workflows/docker-image.yml 的 verify job 保持一致
+  verify-code:
+    name: 代码校验与测试
+    runs-on: golang
+    timeout-minutes: 30
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 在 Dockerfile.verify（与发布镜像同一 Go 基础镜像）内执行三门禁：
+      # runner 无需安装 Go，也不依赖把工作目录 bind mount 进容器
+      - name: 格式检查 / 静态检查 / 单元测试
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.verify
+          platforms: linux/amd64
+          push: false
+          build-args: |
+            GOPROXY=${{ env.GOPROXY }}
+            GO_IMAGE=${{ env.DOCKER_PROXY }}/library/golang:1.27-bookworm
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # 再构建一份本地镜像验证运行身份，失败则阻断推送
+  verify-image:
+    name: 构建镜像并校验非 root 运行
+    needs: verify-code
+    runs-on: golang
+    timeout-minutes: 40
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 生成构建信息
+        id: buildinfo
+        shell: bash
+        run: |
+          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          echo "commit=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - name: 构建本地校验镜像
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ env.IMAGE_NAME }}:verify
+          build-args: |
+            GOPROXY=${{ env.GOPROXY }}
+            APT_MIRROR=${{ env.APT_MIRROR }}
+            GO_IMAGE=${{ env.DOCKER_PROXY }}/library/golang:1.27-bookworm
+            BASE_IMAGE=${{ env.DOCKER_PROXY }}/library/debian:bookworm-slim
+            VERSION=verify
+            COMMIT=${{ steps.buildinfo.outputs.commit }}
+            BUILD_DATE=${{ steps.buildinfo.outputs.date }}
+          provenance: false
+          # 与推送阶段共享层缓存，避免重复编译
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 校验运行身份
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="${{ env.IMAGE_NAME }}:verify"
+
+          # 1) 镜像默认身份必须是非 root（compose 未写 user: 时的兜底）
+          DEFAULT_USER="$(docker inspect -f '{{.Config.User}}' "$IMAGE")"
+          if [[ "$DEFAULT_USER" != "10001:10001" ]]; then
+            echo "::error::镜像默认用户应为 10001:10001，实际为 '${DEFAULT_USER}'"
+            exit 1
+          fi
+          echo "镜像默认用户：${DEFAULT_USER}"
+
+          # 2) 执行身份可被 compose 的 user: 覆盖（任意 UID 均可运行）
+          ACTUAL_UID="$(docker run --rm --user 12345:12345 --entrypoint id "$IMAGE" -u)"
+          if [[ "$ACTUAL_UID" != "12345" ]]; then
+            echo "::error::--user 覆盖失败，实际 uid=${ACTUAL_UID}"
+            exit 1
+          fi
+          echo "覆盖后运行 uid：${ACTUAL_UID}"
+
+          # 3) 版本号可由 -ldflags 注入并正常输出版本信息
+          docker run --rm --entrypoint /app/honeypot "$IMAGE" -version
+
+  build-and-push:
+    name: 构建并推送镜像到 Nexus
+    needs: verify-image
+    # PR 不推送镜像，仅由 verify-code / verify-image 提供门禁
+    if: github.event_name != 'pull_request'
+    runs-on: golang
+    timeout-minutes: 60
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # 提前校验 vars，避免构建完成后才因镜像名/登录失败报错
+      - name: 检查 Nexus 配置
+        shell: bash
+        env:
+          NEXUS_REGISTRY_DOCKER: ${{ vars.NEXUS_REGISTRY_DOCKER }}
+        run: |
+          if [[ -z "$NEXUS_REGISTRY_DOCKER" ]]; then
+            echo "::error::未配置 vars：NEXUS_REGISTRY_DOCKER（Nexus Docker 仓库地址 host[:port][/路径]）"
+            exit 1
+          fi
+          # 镜像 tag 允许 host[:port][/仓库路径]（Nexus 路径式仓库），禁止协议前缀、首尾斜杠、大写字母等，
+          # 提前校验避免构建完才报 invalid reference format
+          if [[ "$NEXUS_REGISTRY_DOCKER" =~ :// || "$NEXUS_REGISTRY_DOCKER" == /* || "$NEXUS_REGISTRY_DOCKER" == */ || "$NEXUS_REGISTRY_DOCKER" == *//* || -n "${NEXUS_REGISTRY_DOCKER//[a-z0-9._\/:-]/}" ]]; then
+            echo "::error::NEXUS_REGISTRY_DOCKER 必须是 host[:port][/路径] 形式（如 nexus.example.com:8082 或 nexus.example.com/repository/docker），不能包含协议前缀、首尾斜杠或大写字母"
+            exit 1
+          fi
+          echo "Nexus 仓库地址：$NEXUS_REGISTRY_DOCKER"
+
+      # 从 tag 解析版本号：release-v2.0.0 -> 2.0.0
+      # 无论 tag 推送还是手动选择 tag 触发，只要 ref 以 release-v 开头即解析；
+      # 手动选择分支触发时无版本号，仅推 latest
+      - name: 解析版本号
+        id: version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_NAME}" == release-v* ]]; then
+            TAG="${GITHUB_REF_NAME#release-v}"
+            if [[ ! "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+              echo "::error::Tag 格式必须为 release-vX.Y.Z，实际为：${GITHUB_REF_NAME}"
+              exit 1
+            fi
+            echo "version=$TAG" >> "$GITHUB_OUTPUT"
+            echo "解析出版本号：$TAG"
+          fi
+
+      # 构建信息通过 -ldflags 注入二进制，供 -version 与启动横幅使用
+      - name: 生成构建信息
+        id: buildinfo
+        shell: bash
+        run: |
+          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          echo "commit=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      # 仅构建 linux/amd64 单架构，无需 QEMU 跨架构模拟
+      - name: 设置 Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 Nexus
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ vars.NEXUS_REGISTRY_DOCKER }}
+          username: ${{ vars.NEXUS_USERNAME }}
+          password: ${{ vars.NEXUS_PASSWORD }}
+
+      # release-v 开头的 tag（推送或手动选择）：2.0.0、latest；手动选择分支：仅 latest
+      - name: 生成镜像标签与元数据
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ vars.NEXUS_REGISTRY_DOCKER }}/scdm/${{ env.IMAGE_NAME }}
+          flavor: |
+            latest=false
+          tags: |
+            type=raw,value=${{ steps.version.outputs.version }},enable=${{ steps.version.outputs.version != '' }}
+            type=raw,value=latest
+
+      - name: 构建并推送镜像
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            GOPROXY=${{ env.GOPROXY }}
+            APT_MIRROR=${{ env.APT_MIRROR }}
+            GO_IMAGE=${{ env.DOCKER_PROXY }}/library/golang:1.27-bookworm
+            BASE_IMAGE=${{ env.DOCKER_PROXY }}/library/debian:bookworm-slim
+            VERSION=${{ steps.version.outputs.version != '' && steps.version.outputs.version || 'latest' }}
+            COMMIT=${{ steps.buildinfo.outputs.commit }}
+            BUILD_DATE=${{ steps.buildinfo.outputs.date }}
+          # 关闭 provenance 证明，避免部分客户端拉取时出现 unknown digest
+          provenance: false
+          # 复用 verify 阶段构建的层缓存
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 输出推送结果
+        shell: bash
+        run: |
+          echo "已推送镜像："
+          echo "${{ steps.meta.outputs.tags }}"

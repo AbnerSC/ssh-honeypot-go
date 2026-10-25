@@ -22,6 +22,9 @@
 #       NEXUS_USERNAME   Nexus 账号
 #       NEXUS_PASSWORD   Nexus 密码
 #   - 已注册可用的 act_runner（标签 golang），且 runner 可执行 docker 命令
+#   - buildx 构建固定使用宿主机网络（driver-opts: network=host），因为内网
+#     Nexus 域名（repo.pi.mmxx.fun 等）只由宿主机侧 DNS 解析，构建容器默认
+#     的桥接网络里解析会超时，导致 go mod download 失败
 #
 # 代码质量门禁（gofmt / go vet / go test -race）不在本工作流内执行，
 # 需在本地或其它流水线中自行保证。
@@ -65,6 +68,12 @@ jobs:
 
       - name: 设置 Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          # 内网 Nexus 域名（GOPROXY / 基础镜像仓库）只有宿主机侧 DNS 能解析，
+          # buildx 默认的桥接网络里解析会 i/o timeout，直接让 buildkitd 复用宿主机
+          # 网络命名空间，构建期（go mod download）与推送期都能正常解析内网域名
+          driver-opts: |
+            network=host
 
       - name: 生成构建信息
         id: buildinfo
@@ -176,6 +185,10 @@ jobs:
       # 仅构建 linux/amd64 单架构，无需 QEMU 跨架构模拟
       - name: 设置 Docker Buildx
         uses: docker/setup-buildx-action@v3
+        with:
+          # 同 verify 阶段：构建容器需借宿主机 DNS 解析内网 Nexus 域名
+          driver-opts: |
+            network=host
 
       - name: 登录 Nexus
         uses: docker/login-action@v3

@@ -15,7 +15,7 @@
 
 ### 1.1 迁移目标
 
-在**不改动运维侧 compose 文件、不影响历史数据、不改变对外协议与接口**的前提下，用 Go 重写 NetGazer 蜜罐的全部功能，并显著降低资源占用（Java 受限堆 160MB / 常驻约 240MB → Go 目标常驻 ≤ 40MB）。
+在**不改动运维侧 compose 文件、不影响历史数据、不改变对外协议与接口**的前提下，用 Go 重写 NetGazer 蜜罐的全部功能，并显著降低资源占用（Java 受限堆 160MB / 常驻约 240MB → Go 目标常驻 ≤ 40MB）。同时将容器运行身份从 root 收敛为非特权账号，具体 UID/GID 由 `docker-compose.yaml` 的 `user:` 指定（镜像默认 10001），降低容器漏洞逃逸到宿主机的风险。
 
 ### 1.2 已确定决策（本方案的硬约束）
 
@@ -26,6 +26,7 @@
 | D3 | 功能一致，实现方式按 Go 特性灵活调整 | 一致性按第 2 章分级：硬契约（配置/数据/API/协议主要交互/日志事件）必须一致；软契约（输出文案细节、内部标记、并发模型）允许等价实现；实现细节允许差异 |
 | D4 | 容器与 CI 参考 `ssh-tunnel-go` | 多阶段构建（`golang:1.27-bookworm` → `debian:bookworm-slim`）、`CGO_ENABLED=0` 静态二进制、`GOPROXY`/`APT_MIRROR`/`DOCKER_PROXY` 构建注入、ldflags 版本注入、内置 `-health` 子命令、Gitea 推 Nexus（amd64）、GitHub 推 Docker Hub（amd64+arm64） |
 | D5 | 方案文档入库 | 即本文件，后续实现偏离需在此登记变更 |
+| D6 | **禁止 root 运行，身份由 compose 指定** | 执行用户与组由 `docker-compose.yaml` 的 `user: "10001:10001"` 固定声明（与镜像默认一致、与宿主机卷属主对齐）；镜像保留 `USER 10001:10001` 仅作 `docker run` 的兜底默认；禁止 `user: "0:0"` / `user: root`；不使用"root 启动再降权"方案 |
 
 ### 1.3 非目标
 
@@ -49,7 +50,7 @@
 | 前端 | 9 个静态资源路径与内容、`/api/vendor/echarts.js`、缓存头、根路径 302 行为 | Playwright E2E + curl 断言 |
 | 协议 | SSH banner / hostkey 指纹 / 认证行为 / 事件分层；Telnet banner 与 IAC 序列；MySQL 8.4 / PG 17 / Redis 7 的握手要素与固定错误码 | 协议回放比对 + `nmap -sV` |
 | 日志 | 6 类事件名、事件字段集合、`session` 编号格式、双写一致性 | JSONL 与 DB 抽样比对 |
-| 运维 | 端口、`/app/logs`、`/app/db` 卷、`curl` healthcheck、root 运行、`TZ`、`SIGTERM` 优雅关闭、`-c/--config` | 真实 compose 冒烟 |
+| 运维 | 端口、`/app/logs`、`/app/db` 卷、hostkey 持久化于 `/app/db/hostkey.ser`、**非 root 运行（默认 `10001:10001`，由 compose `user:` 声明）**、`curl` healthcheck、`TZ`、`SIGTERM` 优雅关闭、`-c/--config` | 真实 compose 冒烟 + 重启后指纹比对 + `id -u` = 10001 + `--user 12345:12345` 可运行 |
 
 ### 2.2 软契约：行为等价即可，允许实现差异
 
@@ -103,11 +104,12 @@
 
 ### 3.2 已确认的现状事实（影响实现决策）
 
-1. `hostkey.ser` 实际内容是 `-----BEGIN OPENSSH PRIVATE KEY-----`（ecdsa-sha2-nistp256，注释 `host key`），Go 可直接 `ssh.ParsePrivateKeyFile` 解析，**SSH 主机指纹无需变化**。
+1. `hostkey.ser` 实际内容是 `-----BEGIN OPENSSH PRIVATE KEY-----`（ecdsa-sha2-nistp256，注释 `host key`），位于 Java 项目根目录、运行路径为 `/app/hostkey.ser`；Go 可直接 `ssh.ParsePrivateKeyFile` 解析，**SSH 主机指纹无需变化**。
 2. 全部结构化数据落在一个 SQLite 文件：`sessions`、`auth_attempts`、`commands`、`downloads`、`ip_locks`、`sys_users`、`sys_audit_log`，`user_version=3`。
-3. Java 版 Dockerfile 未持久化 `hostkey.ser`（只在可写层），容器重建即更换主机密钥；Go 版默认沿用该文件，并支持挂载持久化（增强项，不强制）。
+3. Java 版 Dockerfile 未持久化 `hostkey.ser`（只落容器可写层），容器重建即更换主机密钥。Go 版统一改存 `db/hostkey.ser`（容器内 `/app/db/hostkey.ser`），随 `/app/db` 卷持久化，容器重建与版本升级都不再变化；首次启动会读取旧路径 `hostkey.ser` 完成无感接续（见 5.1）。
 4. `VirtualFileSystem` 由 `Main` 创建**单个实例**并被所有协议服务共享，攻击者写入的文件跨会话可见；Go 版必须保持该语义（读写加锁即可，不要做"每会话独立"的"改进"）。
 5. 前端 `app.js` 调用的 19 个 API 路径与 `ApiController` 完全对齐，`login.html` 仅依赖 `/api/login`；前端可零改动复用。
+6. Java 镜像未声明 `USER`，容器内进程与生成的 `db/*`、`logs/*` 文件属主均为 root；Go 版运行身份改由 compose 的 `user:` 指定，首次升级需将宿主机目录属主交接给该 UID:GID。
 
 ---
 
@@ -141,7 +143,7 @@ ssh-honeypot-go/
 │   └── MIGRATION-PLAN.md    # 本文件
 ├── scripts/conformance/     # 差分与回放脚本
 ├── config.yaml              # 与 Java 版逐字一致
-├── hostkey.ser              # 复用（不入库，运行时生成/挂载）
+├── db/                      # 运行时生成：database.db、hostkey.ser（容器内挂载 /app/db）
 ├── Dockerfile
 ├── docker-entrypoint.sh
 ├── .dockerignore
@@ -210,7 +212,16 @@ func (c *bannerConn) Write(p []byte) (int, error) {
 }
 ```
 
-**hostkey**：优先 `ssh.ParsePrivateKeyFile("hostkey.ser")`（已确认是 OpenSSH 格式）。解析失败时备份为 `hostkey.ser.bak` 并生成新 ed25519 密钥写入同一路径，打印醒目告警。文件不存在则生成。路径固定在工作目录（`/app/hostkey.ser`），与 Java 版一致。
+**hostkey 存放与加载**：密钥统一存放在 `db/hostkey.ser`（容器内 `/app/db/hostkey.ser`），与 `database.db` 同目录，随 `/app/db` 卷持久化，容器重建与镜像升级都不会导致 SSH 指纹变化。
+
+加载顺序（首次升级的关键）：
+
+1. 读 `db/hostkey.ser`（新路径，已持久化）；
+2. 不存在时读旧路径 `hostkey.ser`（Java 1.2.x 的 `/app/hostkey.ser`），解析成功后**复制**到 `db/hostkey.ser`，旧文件保留不删除，便于回滚到 Java 版时继续使用同一指纹；
+3. 两者都不存在：生成 ed25519 密钥写入 `db/hostkey.ser`，文件权限 `0600`，属主为实际运行 UID:GID；
+4. 文件存在但解析失败（非 OpenSSH 格式）：备份为 `<原路径>.bak` 后按第 3 步处理，并打印醒目告警。
+
+约束：启动时先检查 `db`、`logs` 目录与 `config.yaml` 对**实际运行身份**的读写权限，不满足则**立即退出并打印修复命令**（`sudo chown -R <uid>:<gid> logs db`，uid/gid 取 `os.Getuid()`/`os.Getgid()` 的真实值）；启动日志首行打印 `uid=<n> gid=<n>` 便于排查；禁止静默降级或使用临时密钥（否则指纹漂移且重启即变）。
 
 **认证与事件分层**（与 Java 版一致，不可简化）：
 
@@ -348,17 +359,30 @@ RUN if [ -n "${APT_MIRROR}" ]; then \
         sed -i "s|security.debian.org|${APT_MIRROR}|g" /etc/apt/sources.list.d/debian.sources 2>/dev/null || true; \
     fi && \
     apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates curl tzdata && \
+    apt-get install -y --no-install-recommends ca-certificates curl tzdata passwd && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /out/honeypot /app/honeypot
 COPY config.yaml /app/config.yaml
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+
+# 默认非 root 账号（仅作 docker run 时的兜底）：实际执行身份由 compose 的 user: 决定，
+# 因此 /app 内文件需对任意 UID 可读可执行，logs/db 预留可写权限（实际以挂载卷权限为准）
 RUN sed -i 's/\r$//' /usr/local/bin/docker-entrypoint.sh && \
     chmod +x /usr/local/bin/docker-entrypoint.sh && \
-    mkdir -p /app/logs /app/db
+    groupadd -g 10001 honeypot && \
+    useradd -u 10001 -g 10001 -M -s /usr/sbin/nologin honeypot && \
+    mkdir -p /app/logs /app/db && \
+    chown -R 10001:10001 /app && \
+    chmod 0755 /app /app/honeypot && \
+    chmod 0644 /app/config.yaml && \
+    chmod 0777 /app/logs /app/db
 
-# 与 Java 版一致：以 root 运行，保证宿主机挂载的 ./logs ./db 可写
+# 兜底声明：compose 未写 user: 时也不会以 root 运行；
+# compose 中 user: "<UID>:<GID>" 可覆盖此默认值
+USER 10001:10001
+ENV HOME=/tmp
+
 ENTRYPOINT ["docker-entrypoint.sh"]
 
 HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
@@ -370,11 +394,12 @@ VOLUME ["/app/logs", "/app/db"]
 
 与 Java 版镜像的行为对齐点：
 
-- 工作目录 `/app`，配置 `config.yaml`，日志 `logs/honeypot.jsonl`，库 `db/database.db`，hostkey `hostkey.ser`。
-- 不声明 `USER`，保持 root（否则挂载目录不可写，属于破坏性变更）。
-- 保留 `curl`，否则存量 compose 的 healthcheck 永远 unhealthy。
-- `HEALTHCHECK` 用内置子命令（参考项目做法），不依赖 bash `/dev/tcp`。
+- 工作目录 `/app`，配置 `config.yaml`，日志 `logs/honeypot.jsonl`，库 `db/database.db`，hostkey `db/hostkey.ser`（与库同卷，容器重建不丢失）。
+- **以非 root 运行，身份由 compose `user:` 指定**（镜像 `USER 10001:10001` 仅作兜底）：所有监听端口（2222/2323/3306/5432/6379/8080）均大于 1024，无需 `CAP_NET_BIND_SERVICE`，无需任何 Linux capability，因此任意 UID 均可运行。
+- 二进制/配置对任意用户可读可执行（`0755`/`0644`），`logs`/`db` 镜像内预留 `0777`，使 `user:` 仍可临时覆盖为其他 UID（如 CI 用 `12345:12345` 验证）；本项目部署统一使用 `10001:10001`。
+- 一次性权限交接：宿主机 `logs/`、`db/`（及 `config.yaml`）属主需与 compose 中 `user:` 的 UID:GID 一致；Java 版创建的目录属主为 root，升级前必须 `sudo chown -R <UID>:<GID> logs db`。
 - 镜像体积预期：约 90-140MB（debian-slim + 双 xdb 内置库）；若采用"缺库留空"的构建模式可降至约 30MB。
+- 实现上不依赖 `os/user`（仅用 `os.Getuid()`/`os.Getgid()` 数字），`HOME=/tmp`；因此 compose 可指定 `/etc/passwd` 中不存在的 UID，不会因查不到用户而报错。
 
 ### 6.3 docker-entrypoint.sh
 
@@ -404,6 +429,7 @@ exec /app/honeypot "$@"
 | 触发 | push `main` 仅 `latest`；push `release-v*` 推版本号 + `latest`；支持手工触发 |
 | cache | `type=gha`（Gitea 兼容） |
 | 其他 | `provenance: false`、`NEXUS_*` 用 `vars`、构建前校验镜像地址格式 |
+| 安全校验 | 断言 `docker inspect -f '{{.Config.User}}' <image>` 为 `10001:10001`（兜底默认非 root）；再以 `docker run --rm --user 12345:12345 --entrypoint id <image> -u` 验证身份可被 `user:` 覆盖，输出 `12345`；失败则阻断推送 |
 
 ### 6.5 GitHub Actions（推 Docker Hub，amd64 + arm64）
 
@@ -433,39 +459,105 @@ exec /app/honeypot "$@"
 
 ## 7. 无感升级与回滚
 
-### 7.1 升级前后对照（compose 零改动）
+### 7.1 compose 改动清单（基于实际部署文件）
 
-| compose 配置 | 升级后是否变化 | 说明 |
+以现网 compose 为基线（`scdm/ssh-honeypot-j:latest`、bind mount `./logs`/`./db`、未挂载 `config.yaml`、Web `12186:8080`、AI 走环境变量），逐项对照：
+
+| compose 配置 | 升级后 | 说明 |
 | --- | --- | --- |
-| `image: babyfly/ssh-honeypot-j:latest` | 不变 | 镜像名与 tag 保持 |
-| `container_name` / `restart` | 不变 | 无状态容器 |
-| `volumes: ./logs:/app/logs`、`./db:/app/db` | 不变 | 目录结构与权限语义一致（root 运行） |
-| `volumes: ./config.yaml:/app/config.yaml` | 不变 | 配置键与默认值完全兼容 |
-| `environment: TZ / AI_*` | 不变 | 环境变量语义一致 |
-| `ports: 22:2222 / 23:2323 / 3306 / 5432 / 6379 / 127.0.0.1:11800:8080` | 不变 | 端口与协议不变 |
-| `healthcheck: curl -f http://127.0.0.1:8080` | 不变 | 镜像内保留 curl；根路径未登录仍为 302 |
-| `mem_limit: 300m` / `cpus: 0.5` | 不变 | Go 版远低于上限，可后续下调，但非必需 |
-| `logging` / `security_opt` | 不变 | 与实现无关 |
+| `image: scdm/ssh-honeypot-j:latest` | 不变 | 镜像名与 tag 保持（Docker Hub 同名仓库为 `babyfly/ssh-honeypot-j`） |
+| `user: "10001:10001"` | **新增** | 固定运行身份，与镜像默认一致，不随宿主机用户变化；宿主机 `./logs`、`./db` 属主须为 10001；禁止 `0:0`/`root` |
+| `container_name` / `hostname: ubuntu` / `restart: always` | 不变 | `hostname` 继续决定诱捕主机名（Docker hostname > config.yaml > `svr01`） |
+| `volumes: ./logs:/app/logs`、`./db:/app/db` | 不变 | bind mount 路径不变；宿主目录属主需与 `user:` 一致；hostkey 落 `/app/db/hostkey.ser` 后随卷持久化 |
+| `environment: TZ / AI_*`（8 项） | 不变 | 环境变量语义与优先级一致；空值视为未设置 |
+| （未挂载 `config.yaml`） | 不变 | 继续使用镜像内置 `config.yaml` + 环境变量覆盖；若后续挂载，需对运行 UID 可读 |
+| `ports: 22:2222 / 23:2323 / 3306:3306 / 12186:8080` | 不变 | 端口映射不变；PG/Redis 保持注释状态 |
+| `healthcheck: curl -f http://127.0.0.1:8080` | 不变 | 镜像保留 `curl`；`start_period: 20s` 可原样使用（Go 版启动 ≤1s） |
+| `mem_limit: 300m` | 不变（可下调） | Go 版常驻 ≤40MB，实测稳定后可降至 `128m`，非必需 |
+| `security_opt` | **建议新增** | 现网未配置，建议加 `no-new-privileges:true` 与 `cap_drop: [ALL]`（见 7.6） |
+| `logging` | 不变 | 现网未配置，继续使用 Docker 默认 `json-file` |
+
+升级后的完整 compose（除 `user:` 与可选加固外，与现网逐字一致）：
+
+```yaml
+services:
+  ssh-honeypot-j:
+    image: scdm/ssh-honeypot-j:latest
+    container_name: ssh-honeypot-j
+    hostname: ubuntu
+    restart: always
+    user: "10001:10001"        # 新增：固定运行身份；宿主机 ./logs ./db 需属主 10001
+    volumes:
+      - ./logs:/app/logs
+      - ./db:/app/db
+    environment:
+      - TZ=Asia/Shanghai
+      - AI_ENABLED=true
+      - AI_BASE_URL=http://llama-cpp-vulkan:8000/v1
+      - AI_API_KEY=<与原值相同，不入库>
+      - AI_MODEL_NAME=2B
+      - AI_MAX_CONCURRENT=2
+      - AI_TIMEOUT_SECONDS=60
+      - AI_COOLDOWN_SECONDS=10
+    ports:
+      - 22:2222
+      - 23:2323
+      - 3306:3306
+    #   - 5432:5432
+    #   - 6379:6379
+      - 12186:8080
+    mem_limit: 300m
+    security_opt:              # 可选加固（推荐）
+      - no-new-privileges:true
+    cap_drop:                  # 可选加固（推荐）
+      - ALL
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8080"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
+```
+
+`user:` 同时指定 UID 与 GID，改完 `up -d` 即生效、无需重建镜像；镜像内 `USER 10001:10001` 仅在未声明 `user:` 时兜底，避免 `docker run` 手工启动回退 root。
+
+本方案统一采用 **`10001:10001`**：与镜像默认一致，所有机器复用同一份 compose，不随宿主机登录用户变化；镜像内已存在该账号，`/etc/passwd` 有对应条目，无需依赖宿主机用户。代价是宿主机 `ls -l` 显示数字属主，建议在 README 中标注“10001 = honeypot”。
 
 ### 7.2 升级步骤（运维手册）
 
 ```bash
 # 1. 停机并备份（db 含 WAL 文件，必须一起打包）
 docker compose stop
-tar czf honeypot-backup-$(date +%F-%H%M).tgz logs/ db/ config.yaml hostkey.ser 2>/dev/null
+tar czf honeypot-backup-$(date +%F-%H%M).tgz logs/ db/ config.yaml 2>/dev/null
+#   hostkey 已随 db/ 一起备份（db/hostkey.ser）；旧版根目录残留的 hostkey.ser 如需回滚请单独保留
 
-# 2. 数据兼容自检（只读，不修改任何内容）
-docker run --rm -v $PWD/db:/app/db babyfly/ssh-honeypot-j:2.0.0 check-db
+# 2. 权限交接（仅首次从 Java 版升级需要）
+#   Java 版以 root 写入，./logs ./db 属主很可能是 0:0；
+#   先确认属主，再统一改为 10001（与 user: 一致）
+ls -ldn logs db
+sudo chown -R 10001:10001 logs db
+#   仅当另挂了 config.yaml 时才需要：sudo chmod 644 config.yaml
+
+# 3. 数据兼容自检（只读，不修改任何内容）
+docker run --rm --user 10001:10001 -v $PWD/db:/app/db scdm/ssh-honeypot-j:2.0.0 check-db
 #   期望输出：schema OK / user_version=3 / 7 张表行数摘要
 
-# 3. 升级（两种等价方式任选）
+# 4. 升级（两种等价方式任选）
 docker compose pull && docker compose up -d
 #   或显式锁版本：sed -i 's#ssh-honeypot-j:latest#ssh-honeypot-j:2.0.0#' docker-compose.yml
 
-# 4. 验收
-curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8080          # 期望 302
-curl -s http://127.0.0.1:8080/api/me                                   # 期望 401 JSON
+# 5. 验收（注意宿主机映射端口为 12186）
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:12186         # 期望 302
+curl -s http://127.0.0.1:12186/api/me                                  # 期望 401 JSON
 ssh -p 2222 -o StrictHostKeyChecking=no -o BatchMode=yes root@127.0.0.1 # 期望拒绝但 banner 为 OpenSSH
+docker compose exec ssh-honeypot-j id -u                               # 期望 10001（非 0）
+docker inspect -f '{{.HostConfig.SecurityOpt}}' ssh-honeypot-j          # 可选：确认 no-new-privileges 生效
+
+# 6. 验证主机密钥已持久化（重启后指纹不变）
+ssh-keyscan -p 2222 127.0.0.1 2>/dev/null | ssh-keygen -lf -   # 记录指纹
+docker compose restart && sleep 3
+ssh-keyscan -p 2222 127.0.0.1 2>/dev/null | ssh-keygen -lf -   # 指纹应与重启前一致
+ls -l db/hostkey.ser                                            # 期望 -rw------- 10001
 ```
 
 ### 7.3 回滚步骤
@@ -475,6 +567,8 @@ docker compose down
 docker compose pull && docker compose up -d   # 镜像 tag 改回 1.2.1
 # 或：sed -i 's#ssh-honeypot-j:2.0.0#ssh-honeypot-j:1.2.1#' docker-compose.yml
 ```
+
+回滚到 Java 版（root 运行）可直接启动（root 不受属主限制）；但回滚后 Java 版新建的文件会重新变成 root 属主，**再次升级回 Go 版前必须按 compose `user:` 的取值重新执行一次 `sudo chown -R <UID>:<GID> logs db`**。
 
 回滚可行性由三条承诺保证：
 
@@ -491,6 +585,22 @@ docker compose pull && docker compose up -d   # 镜像 tag 改回 1.2.1
 
 蜜罐端口分流会稀释攻击样本，因此采用影子实例：Go 版监听所有端口 +10000、数据库指向副本、日志独立；用 `scripts/conformance/replay.py` 回放录制流量 24 小时，比对协议响应与落库结果。Web 控制台可通过 nginx 将少量流量导向影子实例做真实用户灰度。
 
+### 7.6 容器安全基线
+
+镜像默认即满足下表；带 * 的项目仍需运维在 compose 中显式加固（不强制，不改不影响运行）。
+
+| 项 | 做法 | 状态 |
+| --- | --- | --- |
+| 运行身份 | 由 compose `user: "<UID>:<GID>"` 指定；镜像 `USER 10001:10001` 仅兜底；禁止 `0:0`/`root`；不采用"root 启动后 gosu 降权" | compose 声明 |
+| 文件属主 | `/app` 内文件 `0755`/`0644`、`logs`/`db` `0777`；hostkey `0600` 属主为实际运行 UID | 默认内置 |
+| 权限能力 | 无需任何 capability；建议 `cap_drop: [ALL]` | 建议显式 * |
+| 提权防护 | `security_opt: [no-new-privileges:true]`（存量 compose 已配置） | 建议显式 * |
+| 根文件系统 | 可 `read_only: true` + `tmpfs: [/tmp]`；`/app/logs`、`/app/db` 仍为可写卷 | 可选 * |
+| 网络 | 不使用 `network_mode: host`、不发布 `privileged`；仅映射必要端口 | 建议显式 * |
+| 镜像 | 运行阶段仅 `ca-certificates`/`curl`/`tzdata`/`passwd`，无编译器与 SDK | 默认内置 |
+
+> 注：部署统一使用 `user: "10001:10001"`，宿主机 `./logs`、`./db`（bind mount）属主必须为 10001，否则启动预检失败并打印实际 `uid/gid` 与 chown 命令；校验发生在启动阶段而非运行中，不会产生静默丢数据。后续若改用其他 `user:`，历史库/日志文件属主会不匹配，需同步 `chown`。
+
 ---
 
 ## 8. 验证与测试
@@ -506,7 +616,7 @@ docker compose pull && docker compose up -d   # 镜像 tag 改回 1.2.1
 | 前端 | 登录→总览→五类明细→用户管理→强制改密 | Playwright |
 | 稳定性 | `-race`、并发压测、goroutine 泄漏 | `go test -race`、自建压测脚本 |
 
-### 8.2 性能门禁
+### 8.2 性能与安全门禁
 
 | 指标 | 目标 |
 | --- | --- |
@@ -515,6 +625,8 @@ docker compose pull && docker compose up -d   # 镜像 tag 改回 1.2.1
 | 启动到全部端口可连 | ≤ 1s |
 | 100 并发 SSH + 50 conn/s MySQL 持续 30 分钟 | 无 goroutine 泄漏、无 `database is locked`、日志丢弃计数为 0 |
 | 优雅关闭 | SIGTERM 后 ≤ 2s 退出，JSONL 无半行、DB 可正常打开 |
+| 容器身份 | `docker inspect -f '{{.Config.User}}'` = `10001:10001`；compose 中 `id -u` = 10001；以 `--user 12345:12345` 覆盖后仍能正常启动 |
+| 只读根文件系统 | 开启 `read_only` 后仍能正常启动与抓取攻击（验证临时文件未落到 `/`） |
 
 ---
 
@@ -538,7 +650,7 @@ docker compose pull && docker compose up -d   # 镜像 tag 改回 1.2.1
 
 - `2.0.0-rc.1` = M0-M5（功能主体等价，长尾命令走本地 `command not found`）
 - `2.0.0` = M0-M7（全量功能等价 + 切换演练完成）
-- `2.1.0` = 后续增强（SSH 算法集对齐、内置库裁剪、`hostkey.ser` 持久化默认开启）
+- `2.1.0` = 后续增强（SSH 算法集对齐、内置 IP 库改为可选、hostkey 轮换子命令 `rotate-hostkey`）
 
 ---
 
@@ -550,12 +662,13 @@ docker compose pull && docker compose up -d   # 镜像 tag 改回 1.2.1
 | R2 | SSH 算法列表与 MINA 不同 | 高级指纹识别 | 列为已知差异；2.1.0 提供算法配置项贴近 OpenSSH 8.9p1 |
 | R3 | `modernc.org/sqlite` 与 sqlite-jdbc 锁行为差异 | 偶发 `database is locked` | DSN 固定 PRAGMA；写连接单例；30 分钟压测门禁 |
 | R4 | ip2region v3 xdb 与 Java 输出不一致 | 归属地统计偏差 | M1 万级 IP diff 门禁，不一致阻断发版 |
-| R5 | 镜像改为非 root 或移除 curl | 破坏无感升级（卷不可写/健康检查失败） | Dockerfile 评审 checklist + 真实 compose 冒烟 |
+| R5 | compose `user:` 与宿主机卷属主不一致，导致不可写 | 首次升级启动失败 | 启动前预检 + fail-fast 提示实际 `uid/gid` 与 chown 命令；升级手册第 2 步一次性 `chown`；CI 用 root 属主目录做负向用例 |
 | R6 | 时区与毫秒格式不一致 | 趋势统计跨日错位 | 单测固定 TZ；双栈同时刻写库比对 |
 | R7 | `latest` 被 Go 版覆盖导致未经确认的升级 | 存量部署异常 | 发布纪律（6.6）+ 保留 1.2.1 + 升级/回滚步骤前置在 README |
 | R8 | 有界队列在极端攻击下丢日志 | 数据缺失 | 容量 8192 + 丢弃计数告警 + 配置项 |
 | R9 | 心跳缺失导致 `session_close` 丢失 | 会话统计偏低 | `keepalive@openssh.com` + 2 次无应答断连 + 双栈对拍 |
 | R10 | 打包内置 xdb 导致镜像/二进制膨胀 | 分发体积 | 默认内置（功能优先），提供 `nogeoembed` 构建标签裁剪 |
+| R11 | compose 误配 `user: "0:0"`/`root`，或有人删掉镜像 `USER` 兜底 | 回退为 root，丢失安全边界 | CI 断言 `Config.User` 与 `--user` 覆盖行为；README 与 compose 示例标注禁止 root；评审 checklist 必查 |
 
 ---
 
@@ -642,3 +755,8 @@ docker compose pull && docker compose up -d   # 镜像 tag 改回 1.2.1
 | 日期 | 版本 | 内容 |
 | --- | --- | --- |
 | 2026-10-25 | v1.0 | 方案基线：确定镜像名保持 `ssh-honeypot-j`、Go 版本从 2.0.0 起、一致性分级、构建与 CI 对齐 `ssh-tunnel-go` |
+| 2026-10-25 | v1.1 | hostkey 改存 `/app/db/hostkey.ser` 随 db 卷持久化，保留旧路径 `hostkey.ser` 兼容接续，并补充重启后指纹不变的验收步骤 |
+| 2026-10-25 | v1.2 | 安全加固：镜像改为非 root 运行，禁止 root；补充一次性权限交接、安全基线与容器身份门禁 |
+| 2026-10-25 | v1.3 | 执行用户与组改由 compose `user:` 指定（镜像 `USER` 仅兜底），镜像内权限位适配任意 UID，补充 compose 示例与 UID 对齐校验 |
+| 2026-10-25 | v1.4 | 按实际部署 compose（`scdm/ssh-honeypot-j`、bind mount、未挂 config.yaml、Web 12186、AI 环境变量）校准升级对照与完整示例；补充不依赖 `os/user` 的实现约束 |
+| 2026-10-25 | v1.5 | 固定部署身份为 `10001:10001`（路线 B）：compose、chown、验收与门禁全部对齐；CI 改用 `12345:12345` 验证身份可覆盖 |

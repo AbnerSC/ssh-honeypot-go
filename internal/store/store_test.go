@@ -256,6 +256,167 @@ func TestMigrateLegacyV1(t *testing.T) {
 	}
 }
 
+// TestStatsAggregation 每条事件必须同步累加到按天与按 IP 预聚合表。
+func TestStatsAggregation(t *testing.T) {
+	s := openTemp(t)
+	const ts = "2026-10-25 12:00:00.123"
+	const epoch = int64(1761364800123)
+	const ip = "203.0.113.7"
+
+	steps := []struct {
+		name string
+		fn   func() error
+	}{
+		{"RecordSessionOpen", func() error {
+			return s.RecordSessionOpen(ts, epoch, "s1-abc", "ssh", ip, 51234, "美国 加利福尼亚州")
+		}},
+		{"RecordAuthAttempt 1", func() error {
+			return s.RecordAuthAttempt(ts, epoch, "s1-abc", "ssh", ip, "root", "123456", false, "美国 加利福尼亚州")
+		}},
+		{"RecordAuthAttempt 2", func() error {
+			return s.RecordAuthAttempt(ts, epoch, "s1-abc", "ssh", "198.51.100.9", "admin", "admin", false, "")
+		}},
+		{"RecordCommand", func() error {
+			return s.RecordCommand(ts, epoch, "s1-abc", ip, "root", "uname -a", "美国 加利福尼亚州")
+		}},
+		{"RecordDownload", func() error {
+			return s.RecordDownload(ts, epoch, "s1-abc", ip, "root", "http://evil/x.sh", "")
+		}},
+		{"RecordIPLocked", func() error {
+			return s.RecordIPLocked(ts, epoch, ip, "2026-10-25 13:00:00.000", "")
+		}},
+	}
+	for _, step := range steps {
+		if err := step.fn(); err != nil {
+			t.Fatalf("%s: %v", step.name, err)
+		}
+	}
+
+	var sessions, auth, commands, downloads, locks int64
+	if err := s.db.QueryRow(`SELECT sessions, auth_attempts, commands, downloads, ip_locks
+		FROM stats_daily WHERE day = ?`, "2026-10-25").
+		Scan(&sessions, &auth, &commands, &downloads, &locks); err != nil {
+		t.Fatalf("查询按天统计失败: %v", err)
+	}
+	if sessions != 1 || auth != 2 || commands != 1 || downloads != 1 || locks != 1 {
+		t.Errorf("按天统计不符: sessions=%d auth=%d commands=%d downloads=%d locks=%d",
+			sessions, auth, commands, downloads, locks)
+	}
+
+	var ipAuth, ipCommands int64
+	if err := s.db.QueryRow(`SELECT auth_attempts, commands FROM stats_ip_daily
+		WHERE day = ? AND src_ip = ?`, "2026-10-25", ip).Scan(&ipAuth, &ipCommands); err != nil {
+		t.Fatalf("查询按 IP 统计失败: %v", err)
+	}
+	if ipAuth != 1 || ipCommands != 1 {
+		t.Errorf("按 IP 统计不符: auth=%d commands=%d", ipAuth, ipCommands)
+	}
+
+	// 会话结束不影响统计（只更新明细）
+	if err := s.RecordSessionClose("2026-10-25 12:00:05.000", "s1-abc", 4877); err != nil {
+		t.Fatalf("RecordSessionClose: %v", err)
+	}
+	if err := s.db.QueryRow(`SELECT sessions FROM stats_daily WHERE day = ?`, "2026-10-25").Scan(&sessions); err != nil {
+		t.Fatalf("查询按天统计失败: %v", err)
+	}
+	if sessions != 1 {
+		t.Errorf("会话结束后统计被重复累加: sessions=%d", sessions)
+	}
+}
+
+// TestStatsBackfillFromDetail 旧库（明细有数据、聚合表为空）首次打开必须回溯重建。
+func TestStatsBackfillFromDetail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+
+	first, err := Open(path, nil)
+	if err != nil {
+		t.Fatalf("初始化失败: %v", err)
+	}
+	// 模拟旧库：直接写明细表，不经过 RecordXxx（不累加聚合），版本号也退回 3
+	for _, stmt := range []string{
+		`DELETE FROM stats_daily`,
+		`DELETE FROM stats_ip_daily`,
+		`PRAGMA user_version=3`,
+		`INSERT INTO sessions(session_id, protocol, src_ip, src_port, opened_at, opened_epoch_ms, location)
+		 VALUES('s-java-1','ssh','198.51.100.9',1234,'2026-10-24 01:02:03.000',1761267723000,'美国')`,
+		`INSERT INTO auth_attempts(ts, ts_epoch_ms, src_ip, username, password, success, location)
+		 VALUES('2026-10-24 01:02:04.000',1761267724000,'198.51.100.9','root','x',0,'美国')`,
+		`INSERT INTO commands(ts, ts_epoch_ms, src_ip, username, command, location)
+		 VALUES('2026-10-24 01:02:05.000',1761267725000,'198.51.100.9','root','id','美国')`,
+	} {
+		if _, err := first.db.Exec(stmt); err != nil {
+			t.Fatalf("构造旧数据失败（%s）: %v", stmt, err)
+		}
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("关闭旧库失败: %v", err)
+	}
+
+	second, err := Open(path, nil)
+	if err != nil {
+		t.Fatalf("重开失败: %v", err)
+	}
+	defer second.Close()
+
+	var sessions, auth, commands int64
+	if err := second.db.QueryRow(`SELECT sessions, auth_attempts, commands FROM stats_daily WHERE day = ?`,
+		"2026-10-24").Scan(&sessions, &auth, &commands); err != nil {
+		t.Fatalf("查询回溯结果失败: %v", err)
+	}
+	if sessions != 1 || auth != 1 || commands != 1 {
+		t.Errorf("回溯统计不符: sessions=%d auth=%d commands=%d", sessions, auth, commands)
+	}
+
+	var ipSessions int64
+	var location string
+	if err := second.db.QueryRow(`SELECT sessions, location FROM stats_ip_daily WHERE day = ? AND src_ip = ?`,
+		"2026-10-24", "198.51.100.9").Scan(&ipSessions, &location); err != nil {
+		t.Fatalf("查询按 IP 回溯结果失败: %v", err)
+	}
+	if ipSessions != 1 || location != "美国" {
+		t.Errorf("按 IP 回溯不符: sessions=%d location=%q", ipSessions, location)
+	}
+
+	// 迁移完成后版本号必须已提升，避免每次重启都重扫明细
+	var version int
+	if err := second.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		t.Fatalf("读取版本失败: %v", err)
+	}
+	if version != schemaVersion {
+		t.Errorf("迁移后 user_version = %d, want %d", version, schemaVersion)
+	}
+}
+
+// TestTxBatchWrites 事务批量写入必须生效，且统计与明细在同一事务内可见。
+func TestTxBatchWrites(t *testing.T) {
+	s := openTemp(t)
+	const ts = "2026-10-25 12:00:00.123"
+
+	tx, err := s.Begin()
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := tx.RecordAuthAttempt(ts, 1761364800123, "s1", "ssh", "203.0.113.7", "root", "x", false, "美国"); err != nil {
+			t.Fatalf("事务内写入失败: %v", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	var detail, aggregated int64
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM auth_attempts`).Scan(&detail); err != nil {
+		t.Fatalf("统计明细失败: %v", err)
+	}
+	if err := s.db.QueryRow(`SELECT auth_attempts FROM stats_daily WHERE day = ?`, "2026-10-25").Scan(&aggregated); err != nil {
+		t.Fatalf("统计聚合失败: %v", err)
+	}
+	if detail != 3 || aggregated != 3 {
+		t.Errorf("批量写入不符: detail=%d aggregated=%d", detail, aggregated)
+	}
+}
+
 // TestCloseOrphanSessionsOnOpen 进程重启后必须补齐残留的未关闭会话，
 // 否则 Web 端「在线会话」会永久显示在线。
 func TestCloseOrphanSessionsOnOpen(t *testing.T) {

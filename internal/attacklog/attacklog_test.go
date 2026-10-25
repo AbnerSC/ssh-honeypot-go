@@ -209,3 +209,46 @@ func TestNilLogger(t *testing.T) {
 		t.Errorf("nil Logger.locate = %q, want 空串", got)
 	}
 }
+
+// TestFlushWithinOneSecond 未关闭时事件也应在 1 秒批量刷盘周期内落盘。
+func TestFlushWithinOneSecond(t *testing.T) {
+	dir := t.TempDir()
+	logFile := filepath.Join(dir, "batch.jsonl")
+	dbFile := filepath.Join(dir, "batch.db")
+
+	l, err := New(logFile, dbFile, nil, nil)
+	if err != nil {
+		t.Fatalf("初始化日志器失败: %v", err)
+	}
+	defer l.Close()
+
+	l.Command("s1", "1.2.3.4", "root", "id")
+
+	// 定时器每 1s 触发一次，留出余量后校验 JSONL 已落盘（不依赖 Close）
+	deadline := time.Now().Add(3 * time.Second)
+	var data []byte
+	for time.Now().Before(deadline) {
+		data, _ = os.ReadFile(logFile)
+		if strings.Contains(string(data), `"command":"id"`) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !strings.Contains(string(data), `"command":"id"`) {
+		t.Fatalf("事件未在批量刷盘周期内写入 JSONL: %q", data)
+	}
+
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(dbFile)+"?_pragma=busy_timeout(2000)")
+	if err != nil {
+		t.Fatalf("打开数据库失败: %v", err)
+	}
+	defer db.Close()
+
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM commands`).Scan(&n); err != nil {
+		t.Fatalf("统计命令数失败: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("SQLite 命令数 = %d, want 1", n)
+	}
+}

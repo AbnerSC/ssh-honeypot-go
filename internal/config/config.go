@@ -39,10 +39,6 @@ type Log struct {
 	File string `yaml:"file"`
 	// DB SQLite 数据库文件，与 JSONL 双写同一份数据。
 	DB string `yaml:"db"`
-	// IPDBV4 ip2region IPv4 离线库，缺失时回退二进制内置库。
-	IPDBV4 string `yaml:"ipdb_v4"`
-	// IPDBV6 ip2region IPv6 离线库，缺失时回退二进制内置库。
-	IPDBV6 string `yaml:"ipdb_v6"`
 }
 
 // Web 控制台配置。
@@ -177,10 +173,8 @@ func Default() *Config {
 		PostgreSQL: Service{Enabled: true, Port: 5432},
 		Redis:      Service{Enabled: true, Port: 6379},
 		Log: Log{
-			File:   filepath.Join("logs", "honeypot.jsonl"),
-			DB:     filepath.Join("logs", "database.db"),
-			IPDBV4: filepath.Join("db", "ip2region_v4.xdb"),
-			IPDBV6: filepath.Join("db", "ip2region_v6.xdb"),
+			File: filepath.Join("logs", "honeypot.jsonl"),
+			DB:   filepath.Join("logs", "database.db"),
 		},
 		Web: Web{Enabled: true, Port: 8080, SessionTimeoutMinutes: 30},
 		Auth: Auth{

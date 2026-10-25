@@ -28,10 +28,9 @@ redis:
 
 log:
   file: logs/honeypot.jsonl   # 攻击日志文件路径
-  db: db/database.db        # SQLite 数据库文件（与 JSONL 双写同一份数据，供 Web 可视化）
-  ipdb_v4: db/ip2region_v4.xdb  # IP 归属地离线库文件（ip2region xdb 格式 ipv4），解析来源 IP 为“国家 省份 城市”；
-  ipdb_v6: db/ip2region_v6.xdb  # IP 归属地离线库文件（ip2region xdb 格式 ipv6），解析来源 IP 为“国家 省份 城市”；
-                            # 可选覆盖项：文件缺失时自动回退使用内置库（已随二进制打包），均缺失时归属地留空，不影响其他功能
+  db: db/database.db        # SQLite 数据库文件（与 JSONL 双写同一份数据，供 Web 可视化查询与统计）
+  # IP 归属地库：ip2region xdb 格式（ipv4 + ipv6）已内置在二进制中，无需挂载外部文件，
+  # 也不释放临时文件；仅向量索引常驻内存（约 512KB/库），数据段按需读取。
 
 # 大模型命令仿真：伪 Shell 内置命令表未命中的未知命令（如 ./malware、nmap 等自定义工具）
 # 交给大模型生成仿真终端输出，避免千篇一律的 command not found 被识破；

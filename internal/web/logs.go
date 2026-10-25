@@ -11,8 +11,8 @@ import (
 )
 
 // statsTTL 统计接口结果缓存有效期。
-// 百万级行表上的全量聚合代价高，Dashboard 每次切入会并发拉取 7 个统计接口，
-// 短 TTL 缓存可合并重复扫描；统计展示容忍分钟级延迟。
+// Dashboard 每次切入会并发拉取 7 个统计接口：总览/趋势/IP 排行已走预聚合表，
+// 用户名/口令/地区排行仍扫明细覆盖索引，短 TTL 缓存可合并并发请求的重复查询。
 const statsTTL = 60 * time.Second
 
 // statCache 统计结果 TTL 缓存（键含当日日期，跨日 midnight 后自动失效）。
@@ -58,11 +58,36 @@ func cached[T any](c *statCache, key string, load func() (T, error)) (T, error) 
 type LogRepo struct {
 	db    *sql.DB
 	cache *statCache
+	// agg 预聚合统计表可用（store 建表成功）。
+	// 旧库或独立测试库缺失时回退到明细表全量统计，保证控制台不白屏。
+	agg bool
 }
 
 func newLogRepo(db *sql.DB) *LogRepo {
-	return &LogRepo{db: db, cache: newStatCache()}
+	return &LogRepo{db: db, cache: newStatCache(), agg: hasStatsTables(db)}
 }
+
+// hasStatsTables 探测预聚合统计表是否存在；探测失败按不可用处理（回退明细统计）。
+func hasStatsTables(db *sql.DB) bool {
+	var n int
+	err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('stats_daily','stats_ip_daily')`).Scan(&n)
+	return err == nil && n == 2
+}
+
+// sqlOverviewAgg 预聚合总览：只扫按天表（数十行）与按 IP 聚合表，不碰百万级明细。
+const sqlOverviewAgg = `
+SELECT (SELECT COALESCE(SUM(sessions),0)      FROM stats_daily)        AS total_sessions,
+       (SELECT COALESCE(SUM(auth_attempts),0) FROM stats_daily)        AS total_auth,
+       (SELECT COALESCE(SUM(commands),0)      FROM stats_daily)        AS total_commands,
+       (SELECT COALESCE(SUM(downloads),0)     FROM stats_daily)        AS total_downloads,
+       (SELECT COUNT(DISTINCT src_ip) FROM stats_ip_daily
+         WHERE auth_attempts > 0)                                     AS unique_ips,
+       COALESCE((SELECT sessions      FROM stats_daily WHERE day = ?), 0) AS today_sessions,
+       COALESCE((SELECT auth_attempts FROM stats_daily WHERE day = ?), 0) AS today_auth,
+       COALESCE((SELECT commands      FROM stats_daily WHERE day = ?), 0) AS today_commands,
+       COALESCE((SELECT downloads     FROM stats_daily WHERE day = ?), 0) AS today_downloads,
+       (SELECT COUNT(DISTINCT src_ip) FROM ip_locks
+         WHERE locked_until > datetime('now','localtime'))            AS active_locks`
 
 // sqlOverview 总览统计：各事件总量、独立攻击源 IP 数、今日新增、当前生效锁定 IP 数。
 const sqlOverview = `
@@ -82,16 +107,24 @@ SELECT (SELECT COUNT(*) FROM sessions)                                AS total_s
 func (l *LogRepo) Overview() (map[string]any, error) {
 	key := "overview:" + todayKey()
 	return cached(l.cache, key, func() (map[string]any, error) {
-		today := todayStartMs()
 		var (
 			totalSessions, totalAuth, totalCommands, totalDownloads int64
 			uniqueIPs                                               int64
 			todaySessions, todayAuth, todayCommands                 int64
 			todayDownloads, activeLocks                             int64
 		)
-		err := l.db.QueryRow(sqlOverview, today, today, today, today).Scan(
-			&totalSessions, &totalAuth, &totalCommands, &totalDownloads, &uniqueIPs,
-			&todaySessions, &todayAuth, &todayCommands, &todayDownloads, &activeLocks)
+		var err error
+		if l.agg {
+			day := todayKey()
+			err = l.db.QueryRow(sqlOverviewAgg, day, day, day, day).Scan(
+				&totalSessions, &totalAuth, &totalCommands, &totalDownloads, &uniqueIPs,
+				&todaySessions, &todayAuth, &todayCommands, &todayDownloads, &activeLocks)
+		} else {
+			today := todayStartMs()
+			err = l.db.QueryRow(sqlOverview, today, today, today, today).Scan(
+				&totalSessions, &totalAuth, &totalCommands, &totalDownloads, &uniqueIPs,
+				&todaySessions, &todayAuth, &todayCommands, &todayDownloads, &activeLocks)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("查询总览统计失败: %w", err)
 		}
@@ -119,6 +152,9 @@ func (l *LogRepo) Trend(days int) ([]map[string]any, error) {
 }
 
 func (l *LogRepo) queryTrend(days int) ([]map[string]any, error) {
+	if l.agg {
+		return l.queryTrendAgg(days)
+	}
 	since := sinceDaysMs(days)
 	byDay := make(map[string]*[3]int64, days)
 	queries := []struct {
@@ -176,6 +212,38 @@ func (l *LogRepo) queryTrend(days int) ([]map[string]any, error) {
 	return rows, nil
 }
 
+// queryTrendAgg 从按天聚合表读趋势：一行一天，代价与历史数据量无关。
+func (l *LogRepo) queryTrendAgg(days int) ([]map[string]any, error) {
+	since := time.UnixMilli(sinceDaysMs(days)).Format("2006-01-02")
+	rows, err := l.db.Query(`SELECT day, sessions, auth_attempts, commands FROM stats_daily
+		WHERE day >= ? ORDER BY day`, since)
+	if err != nil {
+		return nil, fmt.Errorf("查询趋势统计失败: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]map[string]any, 0, days)
+	for rows.Next() {
+		var (
+			day                  string
+			sessions, auth, cmds int64
+		)
+		if err := rows.Scan(&day, &sessions, &auth, &cmds); err != nil {
+			return nil, fmt.Errorf("读取趋势统计失败: %w", err)
+		}
+		out = append(out, map[string]any{
+			"day":      day,
+			"sessions": sessions,
+			"auth":     auth,
+			"commands": cmds,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("读取趋势统计失败: %w", err)
+	}
+	return out, nil
+}
+
 // ProtocolDist 会话数按协议分布。
 func (l *LogRepo) ProtocolDist() ([]map[string]any, error) {
 	return cached(l.cache, "protocol", func() ([]map[string]any, error) {
@@ -186,6 +254,10 @@ func (l *LogRepo) ProtocolDist() ([]map[string]any, error) {
 // TopIPs 攻击源 IP 排行（按登录尝试次数）。
 func (l *LogRepo) TopIPs(limit int) ([]map[string]any, error) {
 	return cached(l.cache, "topIps:"+strconv.Itoa(limit), func() ([]map[string]any, error) {
+		if l.agg {
+			return l.listLimit(`SELECT src_ip AS name, SUM(auth_attempts) AS value FROM stats_ip_daily
+				WHERE auth_attempts > 0 GROUP BY src_ip ORDER BY value DESC LIMIT ?`, limit)
+		}
 		return l.listLimit(`SELECT src_ip AS name, COUNT(*) AS value FROM auth_attempts
 			GROUP BY src_ip ORDER BY value DESC LIMIT ?`, limit)
 	})
@@ -210,7 +282,12 @@ func (l *LogRepo) TopPasswords(limit int) ([]map[string]any, error) {
 // TopLocations 攻击源地区排行（国内按省份、国外按国家聚合，空值归入「未知」）。
 func (l *LogRepo) TopLocations(limit int) ([]map[string]any, error) {
 	return cached(l.cache, "topLocations:"+strconv.Itoa(limit), func() ([]map[string]any, error) {
-		rows, err := l.db.Query(`SELECT location, COUNT(*) FROM auth_attempts GROUP BY location`)
+		query := `SELECT location, COUNT(*) FROM auth_attempts GROUP BY location`
+		if l.agg {
+			query = `SELECT location, SUM(auth_attempts) FROM stats_ip_daily
+				WHERE auth_attempts > 0 GROUP BY location`
+		}
+		rows, err := l.db.Query(query)
 		if err != nil {
 			return nil, fmt.Errorf("查询地区统计失败: %w", err)
 		}

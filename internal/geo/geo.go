@@ -1,22 +1,20 @@
 // Package geo 基于 ip2region xdb 离线库解析 IP 归属地，
 // 供攻击日志（sessions/auth_attempts/...）与 Web 审计日志记录「国家 省份 城市」。
 //
-// 加载优先级（与 Java 版 IpLocator 一致）：
-//  1. 配置中的外部文件（log.ipdb_v4 / log.ipdb_v6）
-//  2. 二进制内置库（go:embed，首次使用时释放到临时文件）
-//  3. 均不可用则降级：Locate 恒返回空串，不影响蜜罐运行
+// 库文件：仅使用二进制内置的 xdb（go:embed），不读取外部文件、不释放临时文件；
+// 内置资源随二进制打包，镜像无需挂载 db 卷。
 //
-// 内存策略：采用向量索引（约 512KB/库）常驻内存，数据段按需从文件读取，
-// 避免 37MB 级 v6 库整体加载导致低配额容器内存超限；查询另有进程内结果缓存。
+// 内存策略：只把向量索引（约 512KB/库）读入内存，数据段通过 embed 文件的
+// Seek+Read 按需读取，避免 46MB（v4 约 10MB + v6 约 36MB）整库入堆；
+// 查询另有进程内结果缓存。库不可用时降级：Locate 恒返回空串，不影响蜜罐运行。
 package geo
 
 import (
 	"embed"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,7 +22,7 @@ import (
 	"github.com/lionsoul2014/ip2region/binding/golang/xdb"
 )
 
-// 内置库：随二进制打包，镜像不挂载 db 卷时依然可解析归属地。
+// 内置库：随二进制打包，唯一数据来源。
 //
 //go:embed assets/ip2region_v4.xdb assets/ip2region_v6.xdb
 var builtinFS embed.FS
@@ -37,6 +35,10 @@ const (
 	// builtinV4 / builtinV6 内置库在 embed.FS 中的路径。
 	builtinV4 = "assets/ip2region_v4.xdb"
 	builtinV6 = "assets/ip2region_v6.xdb"
+	// probeV4 / probeV6 启动自检探针：公网地址在库中必有记录，
+	// 解析报错说明库与版本不匹配（如把 v6 库当 v4 用），直接停用该侧避免运行期静默返回空。
+	probeV4 = "1.1.1.1"
+	probeV6 = "2001:4860:4860::8888"
 )
 
 // regionIdx 从「国家|区域|省份|城市|ISP」中取国家、省份、城市。
@@ -50,95 +52,58 @@ type Locator struct {
 	v4    *xdb.Searcher
 	v6    *xdb.Searcher
 	cache map[string]string
-	// tempFiles 内置库释放出的临时文件，Close 时删除。
-	tempFiles []string
 }
 
-// Load 加载 v4/v6 库并构造定位器；文件全部缺失或损坏时返回降级实例并告警，不返回错误。
-func Load(v4Path, v6Path string, logger *slog.Logger) *Locator {
+// Load 打开内置 v4/v6 库并构造定位器；单侧加载失败仅告警并降级，不返回错误。
+func Load(logger *slog.Logger) *Locator {
 	l := &Locator{cache: make(map[string]string, cacheLimit)}
 
-	v4, ok4 := l.openSide("v4", v4Path, builtinV4, xdb.IPv4, logger)
-	if ok4 {
-		l.v4 = v4
+	if s, err := openBuiltin(builtinV4, xdb.IPv4, probeV4); err != nil {
+		warnf(logger, "v4 IP 归属地库不可用，v4 归属地留空: "+err.Error())
+	} else {
+		l.v4 = s
 	}
-	v6, ok6 := l.openSide("v6", v6Path, builtinV6, xdb.IPv6, logger)
-	if ok6 {
-		l.v6 = v6
+	if s, err := openBuiltin(builtinV6, xdb.IPv6, probeV6); err != nil {
+		warnf(logger, "v6 IP 归属地库不可用，v6 归属地留空: "+err.Error())
+	} else {
+		l.v6 = s
 	}
 
 	if l.v4 == nil && l.v6 == nil {
-		warnf(logger, "未加载到任何 IP 库文件（log.ipdb_v4 / log.ipdb_v6），归属地留空")
+		warnf(logger, "内置 IP 归属地库均不可用，归属地留空")
 		return l
 	}
-	infof(logger, fmt.Sprintf("IP 归属地库已加载: v4=%v, v6=%v", l.v4 != nil, l.v6 != nil))
+	infof(logger, fmt.Sprintf("内置 IP 归属地库已加载（仅向量索引常驻内存，数据段按需读取）: v4=%v, v6=%v",
+		l.v4 != nil, l.v6 != nil))
 	return l
 }
 
-// openSide 加载单侧库：外部文件优先，缺失时释放内置库到临时文件；两者均失败返回 false。
-func (l *Locator) openSide(tag, extPath, builtinName string, version *xdb.Version, logger *slog.Logger) (*xdb.Searcher, bool) {
-	source := ""
-	path := strings.TrimSpace(extPath)
-	if path != "" {
-		if _, err := os.Stat(path); err != nil {
-			infof(logger, fmt.Sprintf("%s IP 库文件不存在: %s，回退使用内置库", tag, absPath(path)))
-			path = ""
-		} else {
-			source = absPath(path)
-		}
-	}
-
-	if path == "" {
-		tmp, err := l.extractBuiltin(builtinName)
-		if err != nil {
-			warnf(logger, fmt.Sprintf("%s IP 库既无外部文件也无内置资源 %s，%s 归属地留空: %v",
-				tag, builtinName, tag, err))
-			return nil, false
-		}
-		l.tempFiles = append(l.tempFiles, tmp)
-		path = tmp
-		source = "embed:" + builtinName + "（已释放到 " + tmp + "）"
-	}
-
-	searcher, err := newSearcher(version, path)
+// openBuiltin 打开内置库：只把向量索引（512KB）读入内存，
+// 数据段由 embed 文件直接 Seek+Read，既不落临时文件也不整库入堆。
+func openBuiltin(name string, version *xdb.Version, probe string) (*xdb.Searcher, error) {
+	f, err := builtinFS.Open(name)
 	if err != nil {
-		warnf(logger, fmt.Sprintf("%s IP 库文件加载失败，%s 归属地留空: %v", tag, tag, err))
-		return nil, false
+		return nil, fmt.Errorf("打开内置库 %s 失败: %w", name, err)
 	}
-	infof(logger, fmt.Sprintf("%s IP 归属地库已加载: %s", tag, source))
-	return searcher, true
-}
+	// embed 的 fs.File 实现支持随机读取，可直接作为 xdb 的数据源
+	reader, ok := f.(io.ReadSeekCloser)
+	if !ok {
+		_ = f.Close()
+		return nil, fmt.Errorf("内置库 %s 不支持随机读取", name)
+	}
 
-// newSearcher 优先用向量索引打开（仅索引进内存）；索引读取失败时回退纯文件检索。
-func newSearcher(version *xdb.Version, path string) (*xdb.Searcher, error) {
-	if vIndex, err := xdb.LoadVectorIndexFromFile(path); err == nil {
-		return xdb.NewWithVectorIndex(version, path, vIndex)
-	}
-	return xdb.NewWithFileOnly(version, path)
-}
-
-// extractBuiltin 把内置库写入临时文件（xdb 的向量索引模式需要可随机读取的文件）。
-func (l *Locator) extractBuiltin(name string) (string, error) {
-	data, err := builtinFS.ReadFile(name)
+	vIndex, err := xdb.LoadVectorIndex(reader)
 	if err != nil {
-		return "", err
+		_ = reader.Close()
+		return nil, fmt.Errorf("读取内置库 %s 向量索引失败: %w", name, err)
 	}
-	pattern := "ip2region-" + strings.TrimSuffix(filepath.Base(name), ".xdb") + "-*.xdb"
-	f, err := os.CreateTemp("", pattern)
-	if err != nil {
-		return "", err
+	searcher := xdb.INewSearcher(version, reader, vIndex, nil)
+	// 自检：探针地址解析报错说明库与版本不匹配，关闭后该侧降级
+	if _, err := searcher.Search(probe); err != nil {
+		searcher.Close()
+		return nil, fmt.Errorf("内置库 %s 自检失败（%s）: %w", name, probe, err)
 	}
-	path := f.Name()
-	if _, err := f.Write(data); err != nil {
-		f.Close()
-		os.Remove(path)
-		return "", err
-	}
-	if err := f.Close(); err != nil {
-		os.Remove(path)
-		return "", err
-	}
-	return path, nil
+	return searcher, nil
 }
 
 // Available 库是否可用（v4/v6 任意一个已加载）。
@@ -193,7 +158,7 @@ func (l *Locator) search(ip string) string {
 	return Format(region)
 }
 
-// Close 关闭检索器并清理内置库释放的临时文件。
+// Close 关闭检索器并释放缓存。
 func (l *Locator) Close() {
 	if l == nil {
 		return
@@ -208,10 +173,6 @@ func (l *Locator) Close() {
 		l.v6.Close()
 		l.v6 = nil
 	}
-	for _, path := range l.tempFiles {
-		_ = os.Remove(path)
-	}
-	l.tempFiles = nil
 	l.cache = make(map[string]string)
 }
 
@@ -280,11 +241,4 @@ func warnf(logger *slog.Logger, msg string) {
 	if logger != nil {
 		logger.Warn(msg)
 	}
-}
-
-func absPath(path string) string {
-	if abs, err := filepath.Abs(path); err == nil {
-		return abs
-	}
-	return path
 }

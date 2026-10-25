@@ -18,7 +18,7 @@ func quietLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-// prepareDB 按生产顺序建好 7 张表：攻击日志表来自 store，系统用户/审计表来自 Web 控制台。
+// prepareDB 按生产顺序建好 9 张表：攻击日志表与预聚合表来自 store，系统用户/审计表来自 Web 控制台。
 func prepareDB(t *testing.T, dbPath string) {
 	t.Helper()
 	logger := quietLogger()
@@ -55,7 +55,7 @@ func TestRunCheckDBSchemaOK(t *testing.T) {
 		t.Fatalf("自检应通过, 退出码=%d 输出:\n%s", code, out.String())
 	}
 	text := out.String()
-	for _, want := range []string{"schema OK (user_version=3)", "sessions", "sys_users", "sys_audit_log"} {
+	for _, want := range []string{"schema OK (user_version=4)", "sessions", "stats_daily", "sys_users", "sys_audit_log"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("输出缺少 %q:\n%s", want, text)
 		}

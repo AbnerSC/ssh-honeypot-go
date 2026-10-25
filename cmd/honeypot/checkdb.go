@@ -13,21 +13,23 @@ import (
 	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/config"
 )
 
-// checkDBTables 升级自检期望存在的表（user_version=3）。
+// checkDBTables 自检期望存在的表：5 张攻击日志表 + 2 张预聚合统计表 + 2 张控制台系统表。
 var checkDBTables = []string{
 	"sessions",
 	"auth_attempts",
 	"commands",
 	"downloads",
 	"ip_locks",
+	"stats_daily",
+	"stats_ip_daily",
 	"sys_users",
 	"sys_audit_log",
 }
 
-// checkDBSchemaVersion 期望的 PRAGMA user_version（与 Java 版 1.2.1 一致）。
-const checkDBSchemaVersion = 3
+// checkDBSchemaVersion 期望的 PRAGMA user_version（Go 版当前为 4）。
+const checkDBSchemaVersion = 4
 
-// runCheckDB 只读自检数据库：版本号 + 7 张表行数，供升级前验证 Java 版数据可被 Go 版直接接续。
+// runCheckDB 只读自检数据库：版本号 + 9 张表行数，确认库结构可直接由当前 Go 版接续。
 //
 // 全程只读：DSN 使用 mode=ro + query_only，绝不建表、补列或写入任何内容。
 func runCheckDB(cfg *config.Config, out io.Writer) int {
@@ -73,7 +75,7 @@ func runCheckDB(cfg *config.Config, out io.Writer) int {
 		return 1
 	}
 	if version != checkDBSchemaVersion {
-		fmt.Fprintf(out, "schema OK 但 user_version=%d，期望 %d（Java 1.2.1 应为 3）\n",
+		fmt.Fprintf(out, "schema OK 但 user_version=%d，期望 %d（请先启动一次新版本完成迁移）\n",
 			version, checkDBSchemaVersion)
 	} else {
 		fmt.Fprintf(out, "schema OK (user_version=%d)\n", version)

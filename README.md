@@ -37,7 +37,7 @@ services:
     user: "10001:10001"            # 固定运行身份，禁止 0:0 / root
     volumes:
       - ./logs:/app/logs           # 攻击日志 JSONL
-      - ./db:/app/db               # SQLite 库、hostkey、IP 归属地库
+      - ./db:/app/db               # SQLite 库、hostkey
     environment:
       - TZ=Asia/Shanghai
       - AI_ENABLED=true
@@ -74,8 +74,8 @@ docker compose up -d
 ```
 
 - 宿主机 `./logs`、`./db` 属主不符时启动预检直接失败并打印实际 `uid/gid` 与修复命令，不会静默丢数据
-- IP 归属地库可自行更新：把 `ip2region_v4.xdb` / `ip2region_v6.xdb` 放入 `./db`
-  （[下载地址](https://github.com/lionsoul2014/ip2region)）；缺失时自动回退二进制内置库
+- IP 归属地库（ip2region v4/v6）已内置在二进制中，无需挂载外部文件，也不会释放临时文件；
+  仅向量索引（约 512KB/库）常驻内存，数据段按需读取，避免 46MB 整库入堆
 
 ### 本地构建运行
 
@@ -104,7 +104,7 @@ go build -trimpath -buildvcs=false -o honeypot ./cmd/honeypot
 | `postgresql` | `enabled`,`port` | `true`,`5432` |
 | `redis` | `enabled`,`port` | `true`,`6379` |
 | `web` | `enabled`,`port`,`sessionTimeoutMinutes` | `true`,`8080`,`30` |
-| `log` | `file`,`db`,`ipdb_v4`,`ipdb_v6` | `logs/honeypot.jsonl`、`db/database.db`、`db/ip2region_v4.xdb`、`db/ip2region_v6.xdb` |
+| `log` | `file`,`db` | `logs/honeypot.jsonl`、`db/database.db` |
 | `auth` | `maxFailures`,`windowMinutes`,`lockMinutes`,`credentials` | `3`,`5`,`60`、内置弱口令本 |
 
 `auth.credentials` 是登录密码本（不在表内的账号一律登录失败），支持单密码与密码列表：
@@ -166,7 +166,15 @@ Docker 部署可直接注入环境变量（优先级：环境变量 > `config.ya
 
 ## 日志格式
 
-每行一个 JSON 事件（`logs/honeypot.jsonl`），同时写入 SQLite：
+每行一个 JSON 事件（`logs/honeypot.jsonl`），同时写入 SQLite。
+
+事件先在内存攒批，每 1 秒（或攒满 512 条）落盘一次：JSONL 一次 Flush，SQLite 一个事务提交，
+单条事件不再逐条 fsync。
+
+SQLite 侧除 5 张明细表外，还维护 `stats_daily`（按天）与 `stats_ip_daily`（按天 + 来源 IP）
+两张预聚合表，控制台的总览、趋势与排行直接读聚合结果，不再对百万级明细做全表统计。
+库结构版本记录在 `PRAGMA user_version`（当前为 4）：首次启动自动建表并一次性从明细回溯历史数据，
+百万级库会有短暂耗时，之后启动不再重复。
 
 | 事件 | 字段 |
 | --- | --- |

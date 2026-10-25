@@ -649,3 +649,99 @@ func TestSessionStoreSlidingExpiry(t *testing.T) {
 		t.Fatal("销毁后会话应失效")
 	}
 }
+
+// TestLogRepoAggregateAndFallback 预聚合表可用时走聚合统计；表缺失时回退明细统计。
+func TestLogRepoAggregateAndFallback(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	dbPath := filepath.Join(t.TempDir(), "database.db")
+
+	st, err := store.Open(dbPath, logger)
+	if err != nil {
+		t.Fatalf("初始化攻击日志表失败: %v", err)
+	}
+	now := time.Now()
+	ts := now.Format("2006-01-02 15:04:05.000")
+	epoch := now.UnixMilli()
+	const ip = "203.0.113.7"
+	for _, fn := range []func() error{
+		func() error { return st.RecordSessionOpen(ts, epoch, "s1-agg", "ssh", ip, 1234, "美国") },
+		func() error {
+			return st.RecordAuthAttempt(ts, epoch, "s1-agg", "ssh", ip, "root", "x", false, "美国")
+		},
+		func() error { return st.RecordCommand(ts, epoch, "s1-agg", ip, "root", "id", "美国") },
+	} {
+		if err := fn(); err != nil {
+			t.Fatalf("写入事件失败: %v", err)
+		}
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("关闭失败: %v", err)
+	}
+
+	readDB, err := openReadDB(dbPath)
+	if err != nil {
+		t.Fatalf("打开只读库失败: %v", err)
+	}
+	defer readDB.Close()
+
+	repo := newLogRepo(readDB)
+	if !repo.agg {
+		t.Fatal("store 已建预聚合表，LogRepo 应启用聚合路径")
+	}
+	overview, err := repo.Overview()
+	if err != nil {
+		t.Fatalf("总览统计失败: %v", err)
+	}
+	want := map[string]int64{
+		"totalSessions": 1, "totalAuth": 1, "totalCommands": 1,
+		"uniqueIps": 1, "todaySessions": 1, "todayAuth": 1,
+	}
+	for key, expected := range want {
+		if got := toInt64(overview[key]); got != expected {
+			t.Errorf("聚合总览 %s = %d, want %d", key, got, expected)
+		}
+	}
+
+	trend, err := repo.Trend(7)
+	if err != nil {
+		t.Fatalf("趋势统计失败: %v", err)
+	}
+	if len(trend) != 1 || toInt64(trend[0]["sessions"]) != 1 || toInt64(trend[0]["auth"]) != 1 {
+		t.Errorf("聚合趋势不符: %v", trend)
+	}
+
+	topIPs, err := repo.TopIPs(5)
+	if err != nil {
+		t.Fatalf("IP 排行失败: %v", err)
+	}
+	if len(topIPs) != 1 || topIPs[0]["name"] != ip || toInt64(topIPs[0]["value"]) != 1 {
+		t.Errorf("聚合 IP 排行不符: %v", topIPs)
+	}
+
+	// 回退路径：聚合表缺失时仍能统计明细（防御性兜底）
+	writeDB, err := openWriteDB(dbPath)
+	if err != nil {
+		t.Fatalf("打开写库失败: %v", err)
+	}
+	defer writeDB.Close()
+	for _, ddl := range []string{`DROP TABLE stats_daily`, `DROP TABLE stats_ip_daily`} {
+		if _, err := writeDB.Exec(ddl); err != nil {
+			t.Fatalf("删除聚合表失败（%s）: %v", ddl, err)
+		}
+	}
+
+	fallback := newLogRepo(readDB)
+	if fallback.agg {
+		t.Fatal("聚合表已删除，应回退明细统计")
+	}
+	overview, err = fallback.Overview()
+	if err != nil {
+		t.Fatalf("回退总览统计失败: %v", err)
+	}
+	if got := toInt64(overview["totalSessions"]); got != 1 {
+		t.Errorf("回退总览 totalSessions = %d, want 1", got)
+	}
+	if got := toInt64(overview["todayCommands"]); got != 1 {
+		t.Errorf("回退总览 todayCommands = %d, want 1", got)
+	}
+}

@@ -2,7 +2,8 @@
 // 同时输出到控制台便于实时观察，并把同一份数据双写到 SQLite（store）供 Web 可视化查询。
 //
 // 性能设计：事件提交到有界异步队列，调用方（会话协程）不阻塞在磁盘 I/O 上；
-// 单写入协程串行刷盘，保证 JSONL 行序不乱，也保证 SQLite 单连接写入的线程安全。
+// 单写入协程每 1 秒（或攒满一批）落一次盘：JSONL 一次 Flush，SQLite 一个事务提交，
+// 既保证行序不乱，也把 N 次 fsync 降为 1 次。
 //
 // 事件类型：session_open / auth_attempt / command / download / session_close / ip_locked
 package attacklog
@@ -28,6 +29,10 @@ const (
 	TSLayout = "2006-01-02 15:04:05.000"
 	// queueSize 异步写入队列容量；队列满时丢弃并计数（plan 要求，防止内存无界增长）。
 	queueSize = 8192
+	// flushInterval 批量落盘间隔：事件先在内存攒批，每 1 秒写一次 JSONL 并提交一个 SQLite 事务。
+	flushInterval = time.Second
+	// maxBatch 单批上限：突发流量占满即刷，避免内存膨胀与落盘延迟。
+	maxBatch = 512
 	// closeTimeout 关闭时等待队列排空的上限。
 	closeTimeout = 5 * time.Second
 	// dropReportInterval 队列丢弃计数的告警周期。
@@ -40,8 +45,9 @@ type field struct {
 	value string
 }
 
-// dbSink SQLite 写入动作：与对应 JSONL 记录共用同一时间戳/毫秒时钟，在写协程串行执行。
-type dbSink func(s *store.Store, ts string, epochMs int64) error
+// dbSink SQLite 写入动作：与对应 JSONL 记录共用同一时间戳/毫秒时钟，在写协程批量执行。
+// 参数为 store.Writer：正常攒批时是 *store.Tx（一批一个事务），也便于单测注入。
+type dbSink func(w store.Writer, ts string, epochMs int64) error
 
 // event 待写入的一条事件。
 type event struct {
@@ -127,8 +133,8 @@ func (l *Logger) SessionOpen(sessionID, protocol, ip string, port int) {
 		{"src_port", strconv.Itoa(port)},
 	}
 	fields = appendLocation(fields, location)
-	l.write(fields, func(s *store.Store, ts string, epochMs int64) error {
-		return s.RecordSessionOpen(ts, epochMs, sessionID, protocol, ip, port, location)
+	l.write(fields, func(w store.Writer, ts string, epochMs int64) error {
+		return w.RecordSessionOpen(ts, epochMs, sessionID, protocol, ip, port, location)
 	})
 }
 
@@ -145,8 +151,8 @@ func (l *Logger) AuthAttempt(sessionID, protocol, ip, username, password string,
 		{"success", strconv.FormatBool(success)},
 	}
 	fields = appendLocation(fields, location)
-	l.write(fields, func(s *store.Store, ts string, epochMs int64) error {
-		return s.RecordAuthAttempt(ts, epochMs, sessionID, protocol, ip, username, password, success, location)
+	l.write(fields, func(w store.Writer, ts string, epochMs int64) error {
+		return w.RecordAuthAttempt(ts, epochMs, sessionID, protocol, ip, username, password, success, location)
 	})
 
 	result := "拒绝"
@@ -166,8 +172,8 @@ func (l *Logger) IPLocked(ip string, untilMillis int64) {
 		{"until", until},
 	}
 	fields = appendLocation(fields, location)
-	l.write(fields, func(s *store.Store, ts string, epochMs int64) error {
-		return s.RecordIPLocked(ts, epochMs, ip, until, location)
+	l.write(fields, func(w store.Writer, ts string, epochMs int64) error {
+		return w.RecordIPLocked(ts, epochMs, ip, until, location)
 	})
 
 	infof(l.logger, fmt.Sprintf("源 IP %s 连续登录失败已达上限，锁定至 %s", ip, until))
@@ -184,8 +190,8 @@ func (l *Logger) Command(sessionID, ip, username, cmdline string) {
 		{"command", cmdline},
 	}
 	fields = appendLocation(fields, location)
-	l.write(fields, func(s *store.Store, ts string, epochMs int64) error {
-		return s.RecordCommand(ts, epochMs, sessionID, ip, username, cmdline, location)
+	l.write(fields, func(w store.Writer, ts string, epochMs int64) error {
+		return w.RecordCommand(ts, epochMs, sessionID, ip, username, cmdline, location)
 	})
 
 	infof(l.logger, fmt.Sprintf("[%s] %s$ %s", ip, username, cmdline))
@@ -202,8 +208,8 @@ func (l *Logger) Download(sessionID, ip, username, url string) {
 		{"url", url},
 	}
 	fields = appendLocation(fields, location)
-	l.write(fields, func(s *store.Store, ts string, epochMs int64) error {
-		return s.RecordDownload(ts, epochMs, sessionID, ip, username, url, location)
+	l.write(fields, func(w store.Writer, ts string, epochMs int64) error {
+		return w.RecordDownload(ts, epochMs, sessionID, ip, username, url, location)
 	})
 
 	infof(l.logger, fmt.Sprintf("[%s] 恶意下载: %s", ip, url))
@@ -219,8 +225,8 @@ func (l *Logger) SessionClose(sessionID, ip string, durationMs int64) {
 		{"duration_ms", strconv.FormatInt(durationMs, 10)},
 	}
 	fields = appendLocation(fields, location)
-	l.write(fields, func(s *store.Store, ts string, epochMs int64) error {
-		return s.RecordSessionClose(ts, sessionID, durationMs)
+	l.write(fields, func(w store.Writer, ts string, epochMs int64) error {
+		return w.RecordSessionClose(ts, sessionID, durationMs)
 	})
 }
 
@@ -264,20 +270,34 @@ func (l *Logger) write(fields []field, sink dbSink) {
 	}
 }
 
-// run 单写入协程：串行刷 JSONL 后写 SQLite。
+// run 单写入协程：攒批后串行落盘（每 flushInterval 或攒满 maxBatch 触发一次）。
 func (l *Logger) run() {
 	defer close(l.done)
-	ticker := time.NewTicker(dropReportInterval)
-	defer ticker.Stop()
 
+	flushTicker := time.NewTicker(flushInterval)
+	defer flushTicker.Stop()
+	dropTicker := time.NewTicker(dropReportInterval)
+	defer dropTicker.Stop()
+
+	batch := make([]event, 0, maxBatch)
 	for {
 		select {
 		case ev, ok := <-l.queue:
 			if !ok {
-				return // channel 已关闭且队列已排空
+				l.flush(batch) // channel 已关闭：刷完剩余事件再退出
+				return
 			}
-			l.handle(ev)
-		case <-ticker.C:
+			batch = append(batch, ev)
+			if len(batch) >= maxBatch {
+				l.flush(batch)
+				batch = batch[:0]
+			}
+		case <-flushTicker.C:
+			if len(batch) > 0 {
+				l.flush(batch)
+				batch = batch[:0]
+			}
+		case <-dropTicker.C:
 			if n := l.dropped.Swap(0); n > 0 {
 				warnf(l.logger, fmt.Sprintf("攻击日志队列已满，过去 %s 丢弃 %d 条事件",
 					dropReportInterval, n))
@@ -286,21 +306,59 @@ func (l *Logger) run() {
 	}
 }
 
-func (l *Logger) handle(ev event) {
+// flush 一批事件：JSONL 整体 Flush 一次，SQLite 一个事务提交。
+func (l *Logger) flush(batch []event) {
+	if len(batch) == 0 {
+		return
+	}
+	l.flushLines(batch)
+	if l.db == nil {
+		return
+	}
+
+	tx, err := l.db.Begin()
+	if err != nil {
+		warnf(l.logger, "开启写入事务失败（本批仅写 JSONL）: "+err.Error())
+		return
+	}
+	failed := 0
+	for _, ev := range batch {
+		if ev.dbWrite == nil {
+			continue
+		}
+		if err := ev.dbWrite(tx, ev.tsText, ev.epochMs); err != nil {
+			failed++
+			if failed <= 3 { // 异常流量下避免日志风暴
+				warnf(l.logger, err.Error())
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		warnf(l.logger, fmt.Sprintf("提交写入事务失败（%d 条）: %v", len(batch), err))
+		_ = tx.Rollback()
+		return
+	}
+	if failed > 0 {
+		warnf(l.logger, fmt.Sprintf("本批 %d 条事件中有 %d 条未写入 SQLite", len(batch), failed))
+	}
+}
+
+// flushLines 把整批 JSONL 行写入缓冲并只 Flush 一次。
+func (l *Logger) flushLines(batch []event) {
 	l.fileMu.Lock()
-	_, err := l.writer.WriteString(ev.line + "\n")
+	defer l.fileMu.Unlock()
+
+	var err error
+	for _, ev := range batch {
+		if _, err = l.writer.WriteString(ev.line + "\n"); err != nil {
+			break
+		}
+	}
 	if err == nil {
 		err = l.writer.Flush()
 	}
-	l.fileMu.Unlock()
 	if err != nil {
 		warnf(l.logger, "日志写入失败: "+err.Error())
-	}
-
-	if l.db != nil && ev.dbWrite != nil {
-		if err := ev.dbWrite(l.db, ev.tsText, ev.epochMs); err != nil {
-			warnf(l.logger, err.Error())
-		}
 	}
 }
 

@@ -120,14 +120,39 @@ func TestDiffDetectsIndexAndTableChanges(t *testing.T) {
 	}
 }
 
-func TestDiffDetectsUserVersionBump(t *testing.T) {
+// TestDiffAllowsGoVersionBump Go 版允许比 Java 版版本号更高（迁移由 Go 版自行完成）。
+func TestDiffAllowsGoVersionBump(t *testing.T) {
 	javaPath := newDB(t, 3, ddlSessions)
 	goPath := newDB(t, 4, ddlSessions)
 
+	if diffs := Diff(mustLoad(t, javaPath), mustLoad(t, goPath)); len(diffs) != 0 {
+		t.Fatalf("Go 版版本号更高不应判为差异，实际: %v", diffs)
+	}
+}
+
+// TestDiffDetectsVersionDowngrade Go 版版本号低于 Java 版说明无法接续。
+func TestDiffDetectsVersionDowngrade(t *testing.T) {
+	javaPath := newDB(t, 4, ddlSessions)
+	goPath := newDB(t, 3, ddlSessions)
+
 	diffs := Diff(mustLoad(t, javaPath), mustLoad(t, goPath))
 	joined := strings.Join(diffs, "\n")
-	if !strings.Contains(joined, "user_version：java=3 go=4") {
-		t.Fatalf("未检出版本号提升（回滚风险），实际:\n%s", joined)
+	if !strings.Contains(joined, "user_version：java=4 go=3") {
+		t.Fatalf("未检出降级，实际:\n%s", joined)
+	}
+}
+
+func TestDiffIgnoresGoExtensionTables(t *testing.T) {
+	javaPath := newDB(t, 3, ddlSessions, ddlAuth)
+	// Go 版多建预聚合统计表与同名索引，不应判为结构差异（按扩展表跳过，版本号也允许更高）
+	goPath := newDB(t, 4, ddlSessions, ddlAuth,
+		`CREATE TABLE stats_daily (day TEXT PRIMARY KEY, sessions INTEGER NOT NULL DEFAULT 0)`,
+		`CREATE TABLE stats_ip_daily (day TEXT NOT NULL, src_ip TEXT NOT NULL,
+			auth_attempts INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (day, src_ip))`,
+		`CREATE INDEX idx_stats_ip_daily_ip ON stats_ip_daily(src_ip, auth_attempts)`)
+
+	if diffs := Diff(mustLoad(t, javaPath), mustLoad(t, goPath)); len(diffs) != 0 {
+		t.Fatalf("扩展表不应产生差异，实际: %v", diffs)
 	}
 }
 

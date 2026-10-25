@@ -113,7 +113,7 @@ func serve(configPath string) int {
 
 	// 启动顺序（plan 5.10）：VFS → geo → attacklog/store → auth → 协议监听
 	fs := vfs.New(hostname)
-	locator := geo.Load(cfg.Log.IPDBV4, cfg.Log.IPDBV6, logger)
+	locator := geo.Load(logger)
 	defer locator.Close()
 
 	events, err := attacklog.New(cfg.Log.File, cfg.Log.DB, locator, logger)

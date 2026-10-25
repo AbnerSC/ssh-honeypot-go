@@ -1,6 +1,31 @@
 package geo
 
-import "testing"
+import (
+	"runtime"
+	"testing"
+)
+
+// TestLoadKeepsMemorySmall 加载只应把向量索引（约 512KB/库）读入内存：
+// 两个库合计 46MB，整库读入会带来数十 MB 的堆分配，回归时直接失败。
+func TestLoadKeepsMemorySmall(t *testing.T) {
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+
+	l := Load(nil)
+	defer l.Close()
+	if !l.Available() {
+		t.Fatal("内置 IP 库未能加载")
+	}
+
+	runtime.ReadMemStats(&after)
+	allocated := after.TotalAlloc - before.TotalAlloc
+	t.Logf("加载内置库累计分配 %d KB", allocated/1024)
+	const limit = 12 << 20 // 12MB：远大于 2×512KB 索引，远小于 46MB 整库
+	if allocated > limit {
+		t.Fatalf("加载内置库累计分配 %d bytes（上限 %d），疑似整库读入内存", allocated, limit)
+	}
+}
 
 func TestFormat(t *testing.T) {
 	cases := map[string]string{
@@ -46,8 +71,7 @@ func TestIsPrivate(t *testing.T) {
 
 // TestLocateWithBuiltinDB 用内置 xdb 验证真实解析结果（v4 + v6 + 内网）。
 func TestLocateWithBuiltinDB(t *testing.T) {
-	// 外部路径传空串，强制走内置库
-	l := Load("", "", nil)
+	l := Load(nil)
 	defer l.Close()
 
 	if !l.Available() {
@@ -84,15 +108,6 @@ func TestLocateWithBuiltinDB(t *testing.T) {
 		t.Error("IPv6 公网地址未解析出归属地")
 	} else {
 		t.Logf("2001:4860:4860::8888 -> %s", v6)
-	}
-}
-
-// TestLoadMissingExternalFallsBackBuiltin 外部路径不存在时应回退内置库。
-func TestLoadMissingExternalFallsBackBuiltin(t *testing.T) {
-	l := Load("/nonexistent/ip2region_v4.xdb", "/nonexistent/ip2region_v6.xdb", nil)
-	defer l.Close()
-	if !l.Available() {
-		t.Fatal("外部库缺失时应回退内置库")
 	}
 }
 

@@ -114,7 +114,6 @@ var schemaIndexes = []string{
 // locationTables 需要 location 列的事件表（user_version 3 起的迁移目标）。
 var locationTables = []string{"sessions", "auth_attempts", "commands", "downloads", "ip_locks"}
 
-// 写入语句
 const (
 	sqlInsertSession = `INSERT INTO sessions(session_id, protocol, src_ip, src_port, opened_at, opened_epoch_ms, location) VALUES(?,?,?,?,?,?,?)`
 	sqlCloseSession  = `UPDATE sessions SET closed_at = ?, duration_ms = ? WHERE session_id = ?`

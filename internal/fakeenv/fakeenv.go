@@ -13,7 +13,7 @@ package fakeenv
 
 import "strconv"
 
-/* ---------------- 系统与内核 ---------------- */
+// 系统与内核
 
 const (
 	OSDesc      = "Ubuntu 22.04.3 LTS"
@@ -25,7 +25,7 @@ const (
 	BashVersion = "5.1.16(1)-release"
 )
 
-/* ---------------- 硬件 ---------------- */
+// 硬件
 
 const (
 	CPUModel   = "Intel(R) Xeon(R) Platinum 8375C CPU @ 2.90GHz"
@@ -41,7 +41,7 @@ const (
 	DiskDataSize = "100G"
 )
 
-/* ---------------- 网络 ---------------- */
+// 网络
 
 const (
 	Eth0IP        = "10.23.76.15"
@@ -57,7 +57,7 @@ const (
 	ListenPorts = "sshd:22, nginx:80, mysqld:3306"
 )
 
-/* ---------------- 软件版本（本地命令输出与 AI 提示词共用） ---------------- */
+// 软件版本（本地命令输出与 AI 提示词共用）
 
 const (
 	Docker        = "24.0.7"
@@ -98,7 +98,7 @@ const (
 	Dig           = "9.18.18-0ubuntu0.22.04.1-Ubuntu"
 )
 
-/* ---------------- AI 提示词用的软件清单 ---------------- */
+// AI 提示词用的软件清单
 
 // Installed 已安装软件清单：全栈开发者工具链，大模型对这些命令仿真成功输出。
 const Installed = "docker " + Docker + " (daemon running; one nginx:latest container named 'web', ID a1b2c3d4e5f6, up 3 weeks)" +

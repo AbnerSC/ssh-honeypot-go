@@ -13,7 +13,7 @@ import (
 // usernamePattern 用户名规则：字母、数字、下划线、点、短横线，长度 2-32。
 var usernamePattern = regexp.MustCompile(`^[a-zA-Z0-9_.-]{2,32}$`)
 
-// ============================ 响应与参数工具 ============================
+// 响应与参数工具
 
 // writeJSON 输出 JSON 响应（关闭 HTML 转义，与 Java 版 Gson 输出一致）。
 func writeJSON(w http.ResponseWriter, status int, payload any) {
@@ -154,7 +154,7 @@ func pathID(r *http.Request) (int64, bool) {
 	return id, true
 }
 
-// ============================ 认证相关 ============================
+// 认证相关
 
 // handleLogin POST /api/login
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -258,7 +258,7 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// ============================ 攻击日志统计 ============================
+// 攻击日志统计
 
 // handleOverview GET /api/stats/overview
 func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
@@ -330,7 +330,7 @@ func (s *Server) handleTopPasswords(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, data)
 }
 
-// ============================ 攻击日志明细 ============================
+// 攻击日志明细
 
 // handleSessions GET /api/sessions
 func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
@@ -390,7 +390,7 @@ func (s *Server) handleIPLocks(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, data)
 }
 
-// ============================ 操作审计（仅 admin） ============================
+// 操作审计（仅 admin）
 
 // handleAuditLogs GET /api/audit-logs
 func (s *Server) handleAuditLogs(w http.ResponseWriter, r *http.Request) {
@@ -428,7 +428,7 @@ func (s *Server) handleAuditTrend(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, data)
 }
 
-// ============================ 系统用户管理（仅 admin） ============================
+// 系统用户管理（仅 admin）
 
 // handleUsers GET /api/users
 func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request) {

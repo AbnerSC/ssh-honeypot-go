@@ -7,7 +7,7 @@
 #   - 本文件只会被 Gitea Actions 读取，推送到自建 Nexus
 #
 # 触发方式：
-#   - 提交 PR 时仅执行代码校验（gofmt / vet / test），不构建镜像
+#   - 提交 PR 时构建校验镜像并检查运行身份（非 root），不推送
 #   - 推送 main 分支自动构建，仅推送 latest 标签
 #   - 推送 release-v 开头的 tag（如 release-v2.0.0）自动构建，
 #     推送 版本号（2.0.0）+ latest 标签
@@ -22,7 +22,9 @@
 #       NEXUS_USERNAME   Nexus 账号
 #       NEXUS_PASSWORD   Nexus 密码
 #   - 已注册可用的 act_runner（标签 golang），且 runner 可执行 docker 命令
-#     （代码校验在 Dockerfile.verify 镜像内执行，runner 无需安装 Go）
+#
+# 代码质量门禁（gofmt / go vet / go test -race）不在本工作流内执行，
+# 需在本地或其它流水线中自行保证。
 #
 # 安全门禁：推送前必须验证镜像默认非 root（USER 10001:10001），
 # 且运行身份可被 compose 的 user: 覆盖，避免容器漏洞影响宿主机。
@@ -52,39 +54,9 @@ env:
   DOCKER_PROXY: repo.pi.mmxx.fun/docker-public
 
 jobs:
-  # 代码门禁：格式 / 静态检查 / 单测（含 -race），失败则后续镜像步骤不会执行
-  # 与 .github/workflows/docker-image.yml 的 verify job 保持一致
-  verify-code:
-    name: 代码校验与测试
-    runs-on: golang
-    timeout-minutes: 30
-    steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
-
-      - name: 设置 Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      # 在 Dockerfile.verify（与发布镜像同一 Go 基础镜像）内执行三门禁：
-      # runner 无需安装 Go，也不依赖把工作目录 bind mount 进容器
-      - name: 格式检查 / 静态检查 / 单元测试
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile.verify
-          platforms: linux/amd64
-          push: false
-          build-args: |
-            GOPROXY=${{ env.GOPROXY }}
-            GO_IMAGE=${{ env.DOCKER_PROXY }}/library/golang:1.27-bookworm
-          provenance: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  # 再构建一份本地镜像验证运行身份，失败则阻断推送
+  # 构建一份本地镜像验证运行身份，失败则阻断推送
   verify-image:
     name: 构建镜像并校验非 root 运行
-    needs: verify-code
     runs-on: golang
     timeout-minutes: 40
     steps:
@@ -150,7 +122,7 @@ jobs:
   build-and-push:
     name: 构建并推送镜像到 Nexus
     needs: verify-image
-    # PR 不推送镜像，仅由 verify-code / verify-image 提供门禁
+    # PR 不推送镜像，仅由 verify-image 提供构建与身份校验
     if: github.event_name != 'pull_request'
     runs-on: golang
     timeout-minutes: 60

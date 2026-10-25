@@ -45,7 +45,7 @@ func newTestClient(t *testing.T, ts *httptest.Server) *Client {
 	return c
 }
 
-// ============================ 构造与归一化 ============================
+// 构造与归一化
 
 func TestNewRequiresConfig(t *testing.T) {
 	logger := quietLogger()
@@ -101,7 +101,7 @@ func TestNewRequiresConfig(t *testing.T) {
 	nilClient.Close()
 }
 
-// ============================ 正常调用 ============================
+// 正常调用
 
 func TestGenerateShellOutputSuccess(t *testing.T) {
 	var (
@@ -224,7 +224,7 @@ func TestEmptyContentIsSuccess(t *testing.T) {
 	}
 }
 
-// ============================ 降级路径 ============================
+// 降级路径
 
 func TestFailurePathsDegrade(t *testing.T) {
 	cases := []struct {
@@ -392,7 +392,7 @@ func TestConcurrencyImmediateDegrade(t *testing.T) {
 	}
 }
 
-// ============================ 输出净化 ============================
+// 输出净化
 
 func TestSanitize(t *testing.T) {
 	c := New(testConfig("http://example.com", func(cfg *Config) { cfg.MaxOutputChars = 300 }), quietLogger())

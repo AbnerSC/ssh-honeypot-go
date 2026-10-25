@@ -236,9 +236,7 @@ func (s *Server) handleConn(conn net.Conn) {
 	}
 }
 
-/* ------------------------------------------------------------------ */
-/* 认证                                                                */
-/* ------------------------------------------------------------------ */
+// 认证
 
 // passwordCallback 密码认证：按密码本校验，所有尝试均记录日志。
 //
@@ -272,9 +270,7 @@ func (s *Server) publicKeyCallback(meta ssh.ConnMetadata, key ssh.PublicKey) (*s
 	return nil, errAuthFailed
 }
 
-/* ------------------------------------------------------------------ */
-/* 心跳                                                                */
-/* ------------------------------------------------------------------ */
+// 心跳
 
 // keepalive 定期发送 keepalive@openssh.com 全局请求，连续无应答达上限判定死连接并关闭。
 func (s *Server) keepalive(ctx context.Context, conn *ssh.ServerConn) {
@@ -311,9 +307,7 @@ func (s *Server) keepalive(ctx context.Context, conn *ssh.ServerConn) {
 	}
 }
 
-/* ------------------------------------------------------------------ */
-/* 会话 / 通道                                                         */
-/* ------------------------------------------------------------------ */
+// 会话 / 通道
 
 // handleSession 处理单个 session 通道的请求流：pty-req、window-change、env、shell、exec。
 func (s *Server) handleSession(newChan ssh.NewChannel, conn *ssh.ServerConn) {

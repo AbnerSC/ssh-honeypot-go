@@ -124,9 +124,7 @@ func (s *Shell) Close() {
 	})
 }
 
-/* ------------------------------------------------------------------ */
-/* 行编辑器                                                            */
-/* ------------------------------------------------------------------ */
+// 行编辑器
 
 // readLine 读取一行，处理回显/退格/历史。ok 为 false 表示会话结束。
 func (s *Shell) readLine() (string, bool) {
@@ -186,7 +184,7 @@ func (s *Shell) readLine() (string, bool) {
 			continue
 		}
 		buf = append(buf, b)
-		if err := s.writeRawByte(b); err != nil { // 回显
+		if err := s.writeRawByte(b); err != nil {
 			return "", false
 		}
 	}
@@ -205,7 +203,7 @@ func (s *Shell) handleEscape(buf []byte) []byte {
 
 	var target string
 	switch b2 {
-	case 'A': // 上箭头
+	case 'A':
 		if len(s.nav) == 0 {
 			return buf
 		}
@@ -215,7 +213,7 @@ func (s *Shell) handleEscape(buf []byte) []byte {
 			s.navIdx--
 		}
 		target = s.nav[s.navIdx]
-	case 'B': // 下箭头
+	case 'B':
 		if s.navIdx == -1 {
 			return buf
 		}
@@ -277,9 +275,7 @@ func trimLastRune(b []byte) []byte {
 	return b[:len(b)-size]
 }
 
-/* ------------------------------------------------------------------ */
-/* 输出                                                                */
-/* ------------------------------------------------------------------ */
+// 输出
 
 // write 输出命令结果，并把换行统一规范化为 \r\n（单遍扫描，无中间字符串）。
 func (s *Shell) write(text string) error {

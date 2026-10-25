@@ -1,5 +1,5 @@
 // Command conformance 比对 Java 版（1.2.1）与 Go 版（2.0.0）的数据库结构与 HTTP 契约，
-// 用于升级前自检、影子实例灰度与发版门禁（见 docs/MIGRATION-PLAN.md 8.1）。
+// 用于升级前自检、影子实例灰度与发版门禁。
 //
 // 用法：
 //

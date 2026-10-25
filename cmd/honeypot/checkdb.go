@@ -13,7 +13,7 @@ import (
 	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/config"
 )
 
-// checkDBTables 升级自检期望存在的表（MIGRATION-PLAN 附录 D，user_version=3）。
+// checkDBTables 升级自检期望存在的表（user_version=3）。
 var checkDBTables = []string{
 	"sessions",
 	"auth_attempts",

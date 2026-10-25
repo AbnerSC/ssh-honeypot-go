@@ -154,7 +154,7 @@ func (p *Processor) dispatch(st *shell.Session, name string, args []string, cmdl
 	case "exit", "logout", "quit":
 		return exitOutput()
 
-	/* ---------------- 文件系统 ---------------- */
+		// 文件系统
 	case "help":
 		return text(helpText)
 	case "pwd":
@@ -206,7 +206,7 @@ func (p *Processor) dispatch(st *shell.Session, name string, args []string, cmdl
 	case "sort", "uniq", "cut", "tr", "tee", "paste", "nl", "column", "expand":
 		return text("") // 文本过滤器：成功时本无输出
 
-	/* ---------------- 系统信息 ---------------- */
+		// 系统信息
 	case "echo":
 		return p.echo(args)
 	case "whoami":
@@ -286,7 +286,7 @@ func (p *Processor) dispatch(st *shell.Session, name string, args []string, cmdl
 	case "dd":
 		return text(p.dd(st, args))
 
-	/* ---------------- 网络 ---------------- */
+		// 网络
 	case "ifconfig":
 		return text(p.ifconfig())
 	case "ip":
@@ -320,7 +320,7 @@ func (p *Processor) dispatch(st *shell.Session, name string, args []string, cmdl
 	case "firewall-cmd":
 		return text("success")
 
-	/* ---------------- 进程与权限 ---------------- */
+		// 进程与权限
 	case "kill", "killall", "pkill":
 		return text(p.kill(args))
 	case "su":
@@ -353,7 +353,7 @@ func (p *Processor) dispatch(st *shell.Session, name string, args []string, cmdl
 		}
 		return text("No manual entry for " + name)
 
-	/* ---------------- 包管理与服务 ---------------- */
+		// 包管理与服务
 	case "apt", "apt-get", "aptitude":
 		return text(p.apt(args))
 	case "yum", "dnf":
@@ -394,7 +394,7 @@ func (p *Processor) dispatch(st *shell.Session, name string, args []string, cmdl
 	case "init":
 		return p.initCmd(st, args)
 
-	/* ---------------- 开发工具链 ---------------- */
+		// 开发工具链
 	case "python", "python3":
 		return text(p.python(st, cmdline, args))
 	case "perl", "php", "ruby", "lua", "node":
@@ -442,7 +442,7 @@ func (p *Processor) dispatch(st *shell.Session, name string, args []string, cmdl
 	case "openssl":
 		return text(p.openssl(st, cmdline, args))
 
-	/* ---------------- 解释器/编辑器：交互式挂起或交 AI ---------------- */
+		// 解释器/编辑器：交互式挂起或交 AI
 	case "bash", "sh", "zsh", "dash", "ksh", "screen", "tmux",
 		"vi", "vim", "nano", "emacs", "ed",
 		"exec", "nohup", "disown", "bg", "fg", "jobs":

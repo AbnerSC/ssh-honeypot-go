@@ -196,9 +196,7 @@ func (c *Client) Close() {
 	c.http.CloseIdleConnections()
 }
 
-/* ------------------------------------------------------------------ */
-/* 请求构建与响应解析                                                    */
-/* ------------------------------------------------------------------ */
+// 请求构建与响应解析
 
 type chatMessage struct {
 	Role    string `json:"role"`
@@ -307,9 +305,7 @@ func systemPrompt(hostname, username, cwd string, recent []string) string {
 	return sb.String()
 }
 
-/* ------------------------------------------------------------------ */
-/* 输出净化                                                             */
-/* ------------------------------------------------------------------ */
+// 输出净化
 
 // sanitize 净化模型输出：剥离思考段与代码围栏、过滤控制字符（保留 \n \t）、按上限截断。
 func (c *Client) sanitize(raw string) string {
@@ -343,9 +339,7 @@ func (c *Client) sanitize(raw string) string {
 	return sb.String()
 }
 
-/* ------------------------------------------------------------------ */
-/* 熔断器                                                              */
-/* ------------------------------------------------------------------ */
+// 熔断器
 
 // circuitOpen 熔断开启中则直接降级；到期自动半开（放行下一次请求试探恢复）。
 func (c *Client) circuitOpen() bool {
@@ -367,9 +361,7 @@ func (c *Client) onFailure(reason string) {
 	warnf(c.logger, fmt.Sprintf("AI 服务调用失败（连续第 %d 次）: %s", failures, reason))
 }
 
-/* ------------------------------------------------------------------ */
-/* 小工具                                                              */
-/* ------------------------------------------------------------------ */
+// 小工具
 
 // reason 异常描述：部分实现 Error() 为空串时回退类型名，保证日志可读。
 func reason(err error) string {

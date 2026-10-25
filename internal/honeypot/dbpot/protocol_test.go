@@ -15,9 +15,7 @@ import (
 	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/attacklog"
 )
 
-/* ------------------------------------------------------------------ */
-/* 测试脚手架                                                          */
-/* ------------------------------------------------------------------ */
+// 测试脚手架
 
 type testEnv struct {
 	server *Server
@@ -169,9 +167,7 @@ func assertHasEvent(t *testing.T, events []map[string]string, name string, field
 	t.Fatalf("未找到事件 %s %v\n实际事件: %v", name, fields, events)
 }
 
-/* ------------------------------------------------------------------ */
-/* MySQL                                                               */
-/* ------------------------------------------------------------------ */
+// MySQL
 
 func TestMySQLHandshakeAndAccessDenied(t *testing.T) {
 	env := newTestEnv(t, NewMySQL)
@@ -252,9 +248,7 @@ func mysqlClientRead(c *script) (byte, []byte) {
 	return hdr[3], c.readN(length)
 }
 
-/* ------------------------------------------------------------------ */
-/* PostgreSQL                                                          */
-/* ------------------------------------------------------------------ */
+// PostgreSQL
 
 func TestPostgresStartupAndAuthFailed(t *testing.T) {
 	env := newTestEnv(t, NewPostgres)
@@ -350,9 +344,7 @@ func pgParseError(body []byte) map[byte]string {
 	return out
 }
 
-/* ------------------------------------------------------------------ */
-/* Redis                                                               */
-/* ------------------------------------------------------------------ */
+// Redis
 
 func TestRedisAuthCapture(t *testing.T) {
 	env := newTestEnv(t, NewRedis)

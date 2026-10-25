@@ -17,7 +17,7 @@ import (
 	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/store"
 )
 
-// ============================ 测试脚手架 ============================
+// 测试脚手架
 
 func newTestServer(t *testing.T) (*Server, *httptest.Server) {
 	t.Helper()
@@ -130,7 +130,7 @@ func waitAuditCount(t *testing.T, srv *Server, where string, want int) {
 	t.Fatalf("等待审计记录超时: %s 期望至少 %d 条", where, want)
 }
 
-// ============================ 登录与 API 契约 ============================
+// 登录与 API 契约
 
 func TestLoginAndConsoleAPIs(t *testing.T) {
 	srv, ts := newTestServer(t)
@@ -315,7 +315,7 @@ func TestAuditAndUserAdminPermission(t *testing.T) {
 	}
 }
 
-// ============================ 鉴权与限额 ============================
+// 鉴权与限额
 
 func TestUnauthorizedAccess(t *testing.T) {
 	_, ts := newTestServer(t)
@@ -417,7 +417,7 @@ func TestShouldChangePasswordRequiresOldPassword(t *testing.T) {
 	}
 }
 
-// ============================ 静态资源与 ECharts ============================
+// 静态资源与 ECharts
 
 func TestEChartsEndpoint(t *testing.T) {
 	_, ts := newTestServer(t)
@@ -454,7 +454,7 @@ func TestEChartsEndpoint(t *testing.T) {
 	}
 }
 
-// ============================ 纯函数单测 ============================
+// 纯函数单测
 
 func TestClientIP(t *testing.T) {
 	cases := []struct {

@@ -41,10 +41,10 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: 安装 Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
@@ -75,7 +75,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # 从 tag 解析版本号：release-v2.0.0 -> 2.0.0
       # 无论 tag 推送还是手动选择 tag 触发，只要 ref 以 release-v 开头即解析；
@@ -104,13 +104,13 @@ jobs:
 
       # arm64 跨架构构建需要 QEMU 模拟（运行阶段 FROM 目标架构基础镜像并执行 apt-get）
       - name: 设置 QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: 设置 Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: 登录 Docker Hub
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -118,7 +118,7 @@ jobs:
       # release-v 开头的 tag（推送或手动选择）：2.0.0、latest；手动选择分支：仅 latest
       - name: 生成镜像标签与元数据
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.IMAGE_USERNAME }}/${{ env.IMAGE_NAME }}
           flavor: |
@@ -128,7 +128,7 @@ jobs:
             type=raw,value=latest
 
       - name: 构建并推送镜像
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64

@@ -47,9 +47,9 @@ services:
     environment:
       - TZ=Asia/Shanghai
       - AI_ENABLED=true
-      - AI_BASE_URL=http://llama-cpp-vulkan:8000/v1
-      - AI_API_KEY=
-      - AI_MODEL_NAME=2B
+      - AI_BASE_URL=http://127.0.0.1:8000/v1
+      - AI_API_KEY=abcdefg1234567890
+      - AI_MODEL_NAME=qwen3.8-27b
       - AI_MAX_CONCURRENT=2
       - AI_TIMEOUT_SECONDS=60
       - AI_COOLDOWN_SECONDS=10

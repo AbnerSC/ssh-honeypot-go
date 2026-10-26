@@ -100,7 +100,7 @@ func New(logFile, dbFile string, locator *geo.Locator, logger *slog.Logger) (*Lo
 		done:    make(chan struct{}),
 	}
 
-	if db, err := store.Open(dbFile, logger); err != nil {
+	if db, err := store.Open(dbFile, logger, store.WithCountryResolver(locator)); err != nil {
 		warnf(logger, "SQLite 数据库初始化失败，仅写入 JSONL 日志: "+err.Error())
 	} else {
 		l.db = db
@@ -140,7 +140,7 @@ func (l *Logger) SessionOpen(sessionID, protocol, ip string, port int) {
 
 // AuthAttempt 记录一次登录尝试，并打印控制台摘要。
 func (l *Logger) AuthAttempt(sessionID, protocol, ip, username, password string, success bool) {
-	location := l.locate(ip)
+	region := l.locateRegion(ip)
 	fields := []field{
 		{"event", "auth_attempt"},
 		{"session", sessionID},
@@ -150,9 +150,10 @@ func (l *Logger) AuthAttempt(sessionID, protocol, ip, username, password string,
 		{"password", password},
 		{"success", strconv.FormatBool(success)},
 	}
-	fields = appendLocation(fields, location)
+	fields = appendLocation(fields, region.Location)
 	l.write(fields, func(w store.Writer, ts string, epochMs int64) error {
-		return w.RecordAuthAttempt(ts, epochMs, sessionID, protocol, ip, username, password, success, location)
+		return w.RecordAuthAttempt(ts, epochMs, sessionID, protocol, ip, username, password, success,
+			region.Location, region.Country)
 	})
 
 	result := "拒绝"
@@ -232,10 +233,15 @@ func (l *Logger) SessionClose(sessionID, ip string, durationMs int64) {
 
 // locate 解析来源 IP 归属地；定位器不可用时返回空串（JSONL 不输出该字段，SQLite 存 NULL）。
 func (l *Logger) locate(ip string) string {
+	return l.locateRegion(ip).Location
+}
+
+// locateRegion 解析归属地与所属国家段（登录尝试需要国家段做按国家聚合）。
+func (l *Logger) locateRegion(ip string) geo.Region {
 	if l == nil || l.locator == nil {
-		return ""
+		return geo.Region{}
 	}
-	return l.locator.Locate(ip)
+	return l.locator.LocateRegion(ip)
 }
 
 // appendLocation 归属地非空时才追加字段，与 Java 版「null 不输出」一致。

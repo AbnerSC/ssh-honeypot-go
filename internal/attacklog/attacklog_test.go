@@ -10,6 +10,8 @@ import (
 	"time"
 
 	_ "modernc.org/sqlite"
+
+	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/geo"
 )
 
 func TestBuildLine(t *testing.T) {
@@ -158,6 +160,46 @@ func TestLoggerWritesJSONLAndSQLite(t *testing.T) {
 	if duration != 4877 {
 		t.Errorf("duration_ms = %d, want 4877", duration)
 	}
+}
+
+// TestAuthAttemptRecordsCountry 登录尝试必须把国家段单独写进归属地排行表：
+// 多词国家名（South Korea）拼进 location 后无法反推，按国家聚合只能用 country。
+func TestAuthAttemptRecordsCountry(t *testing.T) {
+	dir := t.TempDir()
+	dbFile := filepath.Join(dir, "country.db")
+
+	loc := geo.Load(nil)
+	if !loc.Available() {
+		t.Skip("内置 IP 库不可用")
+	}
+	defer loc.Close()
+
+	l, err := New(filepath.Join(dir, "country.jsonl"), dbFile, loc, nil)
+	if err != nil {
+		t.Fatalf("初始化失败: %v", err)
+	}
+	l.AuthAttempt("s1", "ssh", "1.1.1.1", "root", "x", false)
+	if err := l.Close(); err != nil {
+		t.Fatalf("关闭失败: %v", err)
+	}
+
+	db, err := sql.Open("sqlite", dbFile)
+	if err != nil {
+		t.Fatalf("打开数据库失败: %v", err)
+	}
+	defer db.Close()
+
+	var location, country string
+	if err := db.QueryRow(`SELECT location, country FROM stats_locations`).Scan(&location, &country); err != nil {
+		t.Fatalf("查询归属地排行失败: %v", err)
+	}
+	if country == "" {
+		t.Fatalf("country 未写入: location=%q", location)
+	}
+	if !strings.HasPrefix(location, country) {
+		t.Errorf("location=%q 应以国家段 %q 开头", location, country)
+	}
+	t.Logf("1.1.1.1 -> location=%q country=%q", location, country)
 }
 
 // TestQueueFullDoesNotBlock 队列灌满后调用必须立即返回（不阻塞会话线程）。

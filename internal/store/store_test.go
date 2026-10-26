@@ -102,7 +102,7 @@ func TestRecordAllEvents(t *testing.T) {
 	if err := s.RecordSessionOpen(ts, epoch, "s1-abc", "ssh", "203.0.113.7", 51234, "中国 广东省 深圳市"); err != nil {
 		t.Fatalf("RecordSessionOpen: %v", err)
 	}
-	if err := s.RecordAuthAttempt(ts, epoch, "s1-abc", "ssh", "203.0.113.7", "root", "123456", true, "中国 广东省 深圳市"); err != nil {
+	if err := s.RecordAuthAttempt(ts, epoch, "s1-abc", "ssh", "203.0.113.7", "root", "123456", true, "中国 广东省 深圳市", "中国"); err != nil {
 		t.Fatalf("RecordAuthAttempt: %v", err)
 	}
 	if err := s.RecordCommand(ts, epoch, "s1-abc", "203.0.113.7", "root", "uname -a", "中国 广东省 深圳市"); err != nil {
@@ -169,7 +169,7 @@ func TestRecordAllEvents(t *testing.T) {
 // TestEmptyLocationWritesNull 空归属地必须写 NULL（Web 统计按 NULL 归入「未知」）。
 func TestEmptyLocationWritesNull(t *testing.T) {
 	s := openTemp(t)
-	if err := s.RecordAuthAttempt("2026-10-25 12:00:00.000", 1, "s1", "ssh", "10.0.0.1", "root", "x", false, ""); err != nil {
+	if err := s.RecordAuthAttempt("2026-10-25 12:00:00.000", 1, "s1", "ssh", "10.0.0.1", "root", "x", false, "", ""); err != nil {
 		t.Fatalf("RecordAuthAttempt: %v", err)
 	}
 	var isNull int
@@ -250,7 +250,7 @@ func TestMigrateLegacyV1(t *testing.T) {
 		t.Errorf("迁移后 user_version = %d, want %d", version, schemaVersion)
 	}
 	// location 列必须已补上且可写入
-	if err := migrated.RecordAuthAttempt("2026-10-25 12:00:00.000", 1, "s1", "ssh", "1.2.3.4", "root", "x", false, "中国 北京"); err != nil {
+	if err := migrated.RecordAuthAttempt("2026-10-25 12:00:00.000", 1, "s1", "ssh", "1.2.3.4", "root", "x", false, "中国 北京", "中国"); err != nil {
 		t.Fatalf("迁移后写入失败: %v", err)
 	}
 	var location string
@@ -277,10 +277,10 @@ func TestStatsAggregation(t *testing.T) {
 			return s.RecordSessionOpen(ts, epoch, "s1-abc", "ssh", ip, 51234, "美国 加利福尼亚州")
 		}},
 		{"RecordAuthAttempt 1", func() error {
-			return s.RecordAuthAttempt(ts, epoch, "s1-abc", "ssh", ip, "root", "123456", false, "美国 加利福尼亚州")
+			return s.RecordAuthAttempt(ts, epoch, "s1-abc", "ssh", ip, "root", "123456", false, "美国 加利福尼亚州", "美国")
 		}},
 		{"RecordAuthAttempt 2", func() error {
-			return s.RecordAuthAttempt(ts, epoch, "s1-abc", "ssh", "198.51.100.9", "admin", "admin", false, "")
+			return s.RecordAuthAttempt(ts, epoch, "s1-abc", "ssh", "198.51.100.9", "admin", "admin", false, "", "")
 		}},
 		{"RecordCommand", func() error {
 			return s.RecordCommand(ts, epoch, "s1-abc", ip, "root", "uname -a", "美国 加利福尼亚州")
@@ -400,12 +400,16 @@ func TestRankingAggregation(t *testing.T) {
 	const epoch = int64(1761364800123)
 
 	for i := 0; i < 3; i++ {
-		if err := s.RecordAuthAttempt(ts, epoch, "s1", "ssh", "203.0.113.7", "root", "123456", false, "美国 加利福尼亚州"); err != nil {
+		if err := s.RecordAuthAttempt(ts, epoch, "s1", "ssh", "203.0.113.7", "root", "123456", false, "美国 加利福尼亚州", "美国"); err != nil {
 			t.Fatalf("RecordAuthAttempt: %v", err)
 		}
 	}
 	// 空归属地单独成键（Web 端归入「未知」），不能与其它地区混在一起
-	if err := s.RecordAuthAttempt(ts, epoch, "s1", "ssh", "198.51.100.9", "admin", "admin", false, ""); err != nil {
+	if err := s.RecordAuthAttempt(ts, epoch, "s1", "ssh", "198.51.100.9", "admin", "admin", false, "", ""); err != nil {
+		t.Fatalf("RecordAuthAttempt: %v", err)
+	}
+	// 多词国家名：拼接后的 location 无法反推国家段，必须单独落 country
+	if err := s.RecordAuthAttempt(ts, epoch, "s1", "ssh", "203.0.113.8", "test", "test", false, "South Korea Seoul", "South Korea"); err != nil {
 		t.Fatalf("RecordAuthAttempt: %v", err)
 	}
 	// 非登录事件不写入排行
@@ -432,6 +436,16 @@ func TestRankingAggregation(t *testing.T) {
 		if got != c.want {
 			t.Errorf("%s = %d, want %d", c.name, got, c.want)
 		}
+	}
+
+	// country 列（user_version 7）：多词国家名必须完整保留，不能被截成首词
+	var country string
+	if err := s.db.QueryRow(`SELECT country FROM stats_locations WHERE location = 'South Korea Seoul'`).
+		Scan(&country); err != nil {
+		t.Fatalf("查询归属地国家段失败: %v", err)
+	}
+	if country != "South Korea" {
+		t.Errorf("country = %q, want %q", country, "South Korea")
 	}
 }
 
@@ -499,7 +513,7 @@ func TestTxBatchWrites(t *testing.T) {
 		t.Fatalf("Begin: %v", err)
 	}
 	for i := 0; i < 3; i++ {
-		if err := tx.RecordAuthAttempt(ts, 1761364800123, "s1", "ssh", "203.0.113.7", "root", "x", false, "美国"); err != nil {
+		if err := tx.RecordAuthAttempt(ts, 1761364800123, "s1", "ssh", "203.0.113.7", "root", "x", false, "美国", "美国"); err != nil {
 			t.Fatalf("事务内写入失败: %v", err)
 		}
 	}
@@ -573,6 +587,74 @@ func TestRetiredIndexesDroppedFromLegacyDB(t *testing.T) {
 	}
 	if rows != 1 {
 		t.Errorf("迁移后明细行数 = %d, want 1", rows)
+	}
+}
+
+// fakeCountries 固定映射的国家段解析器（替代真实的 ip2region 库）。
+type fakeCountries map[string]string
+
+func (f fakeCountries) CountryOf(ip string) string { return f[ip] }
+
+// TestLocationCountryBackfill user_version 7 升级：v6 库的 stats_locations 没有 country 列，
+// 重建后必须按明细的来源 IP 重新解析并回填国家段。
+func TestLocationCountryBackfill(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+
+	first, err := Open(path, nil)
+	if err != nil {
+		t.Fatalf("初始化失败: %v", err)
+	}
+	// 模拟 v6 库：stats_locations 无 country 列，行内只有拼接后的归属地
+	for _, stmt := range []string{
+		`DROP TABLE stats_locations`,
+		`CREATE TABLE stats_locations (
+			location      TEXT    NOT NULL PRIMARY KEY,
+			auth_attempts INTEGER NOT NULL DEFAULT 0)`,
+		`INSERT INTO stats_locations(location, auth_attempts) VALUES('South Korea Seoul', 2)`,
+		`INSERT INTO stats_locations(location, auth_attempts) VALUES('', 1)`,
+		`PRAGMA user_version=6`,
+		`INSERT INTO auth_attempts(ts, ts_epoch_ms, src_ip, username, password, success, location)
+		 VALUES('2026-10-24 01:02:04.000',1761267724000,'198.51.100.9','root','x',0,'South Korea Seoul')`,
+	} {
+		if _, err := first.db.Exec(stmt); err != nil {
+			t.Fatalf("构造旧库失败（%s）: %v", stmt, err)
+		}
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("关闭旧库失败: %v", err)
+	}
+
+	second, err := Open(path, nil, WithCountryResolver(fakeCountries{"198.51.100.9": "South Korea"}))
+	if err != nil {
+		t.Fatalf("迁移打开失败: %v", err)
+	}
+	defer second.Close()
+
+	cases := []struct {
+		location string
+		want     string
+	}{
+		{"South Korea Seoul", "South Korea"}, // 按明细 IP 重新解析后回填
+		{"", ""},                             // 未知归属地无从解析，保持空串
+	}
+	for _, c := range cases {
+		var country string
+		if err := second.db.QueryRow(`SELECT country FROM stats_locations WHERE location = ?`, c.location).
+			Scan(&country); err != nil {
+			t.Fatalf("查询 %q 的国家段失败: %v", c.location, err)
+		}
+		if country != c.want {
+			t.Errorf("location=%q country=%q, want %q", c.location, country, c.want)
+		}
+	}
+
+	// 回填后版本号必须已提升，避免每次启动重扫明细
+	var version int
+	if err := second.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		t.Fatalf("读取版本失败: %v", err)
+	}
+	if version != schemaVersion {
+		t.Errorf("迁移后 user_version = %d, want %d", version, schemaVersion)
 	}
 }
 

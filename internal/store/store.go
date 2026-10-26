@@ -18,6 +18,8 @@
 // Web 端统计接口直接读聚合结果，不再对百万级明细表做全表 COUNT / GROUP BY；
 // 排行表不带 day 维度：排行榜只按累计次数排序，按天再拆只会把行数放大到「天数 × 去重值」。
 // user_version 6 退役明细表上的口令 / 归属地索引（见 schemaRetiredIndexes）。
+// user_version 7 给 stats_locations 补 country 列：多词国家名（South Korea）无法从
+// 「国家 省份 城市」反推，按国家聚合只能依赖解析时单独保留的国家段。
 //
 // init 中的建表与数据迁移都是幂等的，全部成功后才写入 user_version；Go 版是唯一实现，
 // 升级后不回退到 Java 版，因此版本号可以正常递增（见 schemaVersion）。
@@ -39,12 +41,13 @@ import (
 // 1：初始表结构；2：sessions 增加 location；3：其余含来源 IP 的事件表增加 location；
 // 4：新增预聚合统计表 stats_daily / stats_ip_daily；
 // 5：新增累计排行表 stats_usernames / stats_passwords / stats_locations；
-// 6：退役 auth_attempts(password) / auth_attempts(location) 两条明细索引。
+// 6：退役 auth_attempts(password) / auth_attempts(location) 两条明细索引；
+// 7：stats_locations 增加 country 列（多词国家名无法从拼接结果反推）。
 //
 // Go 版是唯一实现，升级后不再回退到 Java 版，因此版本号按需正常递增。
 // 版本号标识库结构代次（供 checkdb 与运维自检）；数据迁移的触发条件则由
 // migrateStats 依据聚合表与明细表的实际状态判断，不依赖版本号。
-const schemaVersion = 6
+const schemaVersion = 7
 
 // schemaTables 建表语句（幂等）。数据库版本通过 user_version 管理，便于以后迁移。
 var schemaTables = []string{
@@ -145,6 +148,7 @@ CREATE TABLE IF NOT EXISTS stats_passwords (
 	`
 CREATE TABLE IF NOT EXISTS stats_locations (
     location         TEXT    NOT NULL PRIMARY KEY,   -- 归属地原文（国家 省份 城市），空串表示未知
+    country          TEXT    NOT NULL DEFAULT '',    -- 国家段（user_version 7）：按国家聚合用，旧数据为空串
     auth_attempts    INTEGER NOT NULL DEFAULT 0
 )`,
 }
@@ -236,8 +240,11 @@ ON CONFLICT(username) DO UPDATE SET auth_attempts = auth_attempts + excluded.aut
 	sqlUpsertPassword = `INSERT INTO stats_passwords(password, auth_attempts) VALUES(?,?)
 ON CONFLICT(password) DO UPDATE SET auth_attempts = auth_attempts + excluded.auth_attempts`
 
-	sqlUpsertLocation = `INSERT INTO stats_locations(location, auth_attempts) VALUES(?,?)
-ON CONFLICT(location) DO UPDATE SET auth_attempts = auth_attempts + excluded.auth_attempts`
+	sqlUpsertLocation = `INSERT INTO stats_locations(location, country, auth_attempts) VALUES(?,?,?)
+ON CONFLICT(location) DO UPDATE SET
+    auth_attempts = auth_attempts + excluded.auth_attempts,
+    -- 老数据（country 为空串）首次按新版本写入时补齐国家段，已有值不覆盖
+    country = CASE WHEN stats_locations.country = '' THEN excluded.country ELSE stats_locations.country END`
 )
 
 // 回填 SQL：把五张明细表的增量用 UNION ALL 归一到同一形状，再按天（或天+IP）汇总；
@@ -284,9 +291,11 @@ SELECT password, COUNT(*) FROM auth_attempts
 WHERE password <> ''
 GROUP BY password`
 
+	// country 由 init 的 backfillLocationCountry 用来源 IP 重新解析后回填：
+	// 建表时无法从「国家 省份 城市」反推多词国家名。
 	sqlBackfillLocations = `
-INSERT INTO stats_locations(location, auth_attempts)
-SELECT COALESCE(location, ''), COUNT(*) FROM auth_attempts
+INSERT INTO stats_locations(location, country, auth_attempts)
+SELECT COALESCE(location, ''), '', COUNT(*) FROM auth_attempts
 GROUP BY COALESCE(location, '')`
 )
 
@@ -313,7 +322,7 @@ const (
 type Writer interface {
 	RecordSessionOpen(ts string, epochMs int64, sessionID, protocol, ip string, port int, location string) error
 	RecordSessionClose(ts, sessionID string, durationMs int64) error
-	RecordAuthAttempt(ts string, epochMs int64, sessionID, protocol, ip, username, password string, success bool, location string) error
+	RecordAuthAttempt(ts string, epochMs int64, sessionID, protocol, ip, username, password string, success bool, location, country string) error
 	RecordCommand(ts string, epochMs int64, sessionID, ip, username, cmdline, location string) error
 	RecordDownload(ts string, epochMs int64, sessionID, ip, username, url, location string) error
 	RecordIPLocked(ts string, epochMs int64, ip, until, location string) error
@@ -324,15 +333,32 @@ type execer interface {
 	statement(key stmtKey) (*sql.Stmt, error)
 }
 
+// CountryResolver 由来源 IP 解析国家段（ip2region 库）。
+// 只在 user_version 7 升级回填历史 stats_locations 行时用到：
+// 拼接后的归属地无法反推多词国家名，必须回到 IP 重新解析。
+type CountryResolver interface {
+	CountryOf(ip string) string
+}
+
+// Option Open 的可选配置。
+type Option func(*Store)
+
+// WithCountryResolver 注入国家段解析器（通常即 geo.Locator）。
+// 未注入时 country 列保持空串，Web 端按旧逻辑从 location 首段推断。
+func WithCountryResolver(r CountryResolver) Option {
+	return func(s *Store) { s.countries = r }
+}
+
 // Store 攻击日志持久化存储。
 type Store struct {
-	db     *sql.DB
-	logger *slog.Logger
-	stmts  [stmtCount]*sql.Stmt
+	db        *sql.DB
+	logger    *slog.Logger
+	stmts     [stmtCount]*sql.Stmt
+	countries CountryResolver
 }
 
 // Open 打开（必要时创建）数据库并完成建表与版本迁移。
-func Open(path string, logger *slog.Logger) (*Store, error) {
+func Open(path string, logger *slog.Logger, opts ...Option) (*Store, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return nil, fmt.Errorf("解析数据库路径 %s 失败: %w", path, err)
@@ -351,6 +377,9 @@ func Open(path string, logger *slog.Logger) (*Store, error) {
 	db.SetConnMaxLifetime(0)
 
 	s := &Store{db: db, logger: logger}
+	for _, opt := range opts {
+		opt(s)
+	}
 	if err := s.init(); err != nil {
 		db.Close()
 		return nil, err
@@ -377,6 +406,13 @@ func dsn(abs string) string {
 // init 执行建表、补列迁移、建索引与 user_version 写入。
 // 顺序不可调换：旧库的事件表缺少 location 列时必须先补列，否则建索引会报 no such column。
 func (s *Store) init() error {
+	// 先读升级前的版本：country 回填这类一次性数据迁移只在跨版本时执行，
+	// 避免每次启动都重扫明细表。
+	version, err := s.readVersion()
+	if err != nil {
+		return err
+	}
+
 	for _, ddl := range schemaTables {
 		if _, err := s.db.Exec(ddl); err != nil {
 			return fmt.Errorf("初始化表结构失败: %w", err)
@@ -386,6 +422,11 @@ func (s *Store) init() error {
 	// 旧库迁移：不依赖 user_version，逐表检查 location 是否存在（对新建库为空操作，更健壮）
 	for _, table := range locationTables {
 		s.ensureColumn(table, "location", "ALTER TABLE "+table+" ADD COLUMN location TEXT")
+	}
+	// stats_locations.country（user_version 7）：这里失败必须中断启动，
+	// 缺列会让每次登录尝试的排行 UPSERT 报错，继续运行等于丢掉全部归属地排行。
+	if err := s.ensureLocationCountry(); err != nil {
+		return err
 	}
 
 	for _, ddl := range schemaIndexes {
@@ -417,8 +458,19 @@ func (s *Store) init() error {
 	// 版本迁移：user_version 4 引入按天/按 IP 聚合表，5 引入排行表；
 	// 旧库需要从明细回溯历史数据。必须在写入 user_version 之前完成，
 	// 中途失败时下次启动会重试。
-	if err := s.migrateStats(); err != nil {
+	rebuilt, err := s.migrateStats()
+	if err != nil {
 		return err
+	}
+
+	// user_version 7：给历史 stats_locations 行补齐国家段。
+	// 排行表回填（rebuildRankings）只能写入空串 country，因为 SQLite 侧
+	// 无法解析 IP，必须回到 Go 里用 ip2region 重新解析，因此排在它之后；
+	// 排行表被清空重建时同样需要重新回填（country 列随行一起被删）。
+	if version < 7 || rebuilt {
+		if err := s.backfillLocationCountry(); err != nil {
+			return err
+		}
 	}
 
 	if _, err := s.db.Exec(fmt.Sprintf("PRAGMA user_version=%d", schemaVersion)); err != nil {
@@ -440,6 +492,118 @@ func (s *Store) reportFreePages() {
 	if free := pages * pageSize; free > 8<<20 {
 		infof(s.logger, fmt.Sprintf("库内空闲页约 %d MB（退役索引释放），可离线执行 VACUUM 回收磁盘", free>>20))
 	}
+}
+
+// readVersion 读取当前数据库版本（全新库为 0）。
+func (s *Store) readVersion() (int, error) {
+	var v int
+	if err := s.db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
+		return 0, fmt.Errorf("读取数据库版本失败: %w", err)
+	}
+	return v, nil
+}
+
+// ensureLocationCountry 给 stats_locations 补 country 列（user_version 7）。
+// 与 ensureColumn 不同：这里失败直接返回错误，由 init 中断启动。
+func (s *Store) ensureLocationCountry() error {
+	exists, err := s.hasColumn("stats_locations", "country")
+	if err != nil {
+		return fmt.Errorf("检查列 stats_locations.country 失败: %w", err)
+	}
+	if exists {
+		return nil
+	}
+	if _, err := s.db.Exec(`ALTER TABLE stats_locations ADD COLUMN country TEXT NOT NULL DEFAULT ''`); err != nil {
+		return fmt.Errorf("迁移列 stats_locations.country 失败: %w", err)
+	}
+	return nil
+}
+
+// backfillLocationCountry 给历史 stats_locations 行补齐国家段（user_version 7）。
+//
+// 拼接后的 location（「国家 省份 城市」）无法反推多词国家名（South Korea、United
+// States），因此按 location 取一条明细记录的来源 IP，用 ip2region 重新解析。
+// 每个 location 只取一个 IP（MIN）足够：同一归属地串对应的 IP 国家段必然相同。
+//
+// 结果集必须先读完并关闭再开事务：写连接池上限为 1，边读边写会死锁。
+func (s *Store) backfillLocationCountry() error {
+	if s.countries == nil {
+		return nil
+	}
+
+	pending, err := s.pendingLocations()
+	if err != nil || len(pending) == 0 {
+		return err
+	}
+
+	rows, err := s.db.Query(`SELECT location, MIN(src_ip) FROM auth_attempts
+		WHERE location IS NOT NULL AND location <> ''
+		GROUP BY location`)
+	if err != nil {
+		return fmt.Errorf("查询待回填归属地失败: %w", err)
+	}
+	type fill struct{ location, country string }
+	fills := make([]fill, 0, len(pending))
+	for rows.Next() {
+		var location, ip string
+		if err := rows.Scan(&location, &ip); err != nil {
+			rows.Close()
+			return fmt.Errorf("读取待回填归属地失败: %w", err)
+		}
+		if !pending[location] {
+			continue
+		}
+		if country := s.countries.CountryOf(ip); country != "" {
+			fills = append(fills, fill{location, country})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("读取待回填归属地失败: %w", err)
+	}
+	rows.Close()
+	if len(fills) == 0 {
+		return nil
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("开启国家段回填事务失败: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }() // 已提交时为 ErrTxDone，可忽略
+
+	start := time.Now()
+	for _, f := range fills {
+		if _, err := tx.Exec(`UPDATE stats_locations SET country = ? WHERE location = ? AND country = ''`,
+			f.country, f.location); err != nil {
+			return fmt.Errorf("回填归属地国家段失败: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交国家段回填事务失败: %w", err)
+	}
+	infof(s.logger, fmt.Sprintf("归属地国家段已回填 %d 行，耗时 %s", len(fills), time.Since(start).Round(time.Millisecond)))
+	return nil
+}
+
+// pendingLocations 列出 stats_locations 中 country 为空的行（排行表行数与去重
+// 归属地数相当，扫描代价与明细表规模无关）。
+func (s *Store) pendingLocations() (map[string]bool, error) {
+	rows, err := s.db.Query(`SELECT location FROM stats_locations WHERE country = ''`)
+	if err != nil {
+		return nil, fmt.Errorf("查询待回填归属地失败: %w", err)
+	}
+	defer rows.Close()
+
+	out := make(map[string]bool, 64)
+	for rows.Next() {
+		var location string
+		if err := rows.Scan(&location); err != nil {
+			return nil, fmt.Errorf("读取待回填归属地失败: %w", err)
+		}
+		out[location] = true
+	}
+	return out, rows.Err()
 }
 
 // ensureColumn 列不存在时补加，失败仅告警（不阻塞启动）。
@@ -532,10 +696,11 @@ func (s *Store) RecordSessionClose(ts, sessionID string, durationMs int64) error
 	return recordSessionClose(s, ts, sessionID, durationMs)
 }
 
-// RecordAuthAttempt 记录一次登录尝试。
+// RecordAuthAttempt 记录一次登录尝试；location 为「国家 省份 城市」，
+// country 为国家段（只用于归属地排行表按国家聚合，不落明细表）。
 func (s *Store) RecordAuthAttempt(ts string, epochMs int64, sessionID, protocol, ip,
-	username, password string, success bool, location string) error {
-	return recordAuthAttempt(s, ts, epochMs, sessionID, protocol, ip, username, password, success, location)
+	username, password string, success bool, location, country string) error {
+	return recordAuthAttempt(s, ts, epochMs, sessionID, protocol, ip, username, password, success, location, country)
 }
 
 // RecordCommand 记录一条命令。
@@ -601,8 +766,8 @@ func (t *Tx) RecordSessionClose(ts, sessionID string, durationMs int64) error {
 
 // RecordAuthAttempt 记录一次登录尝试（事务内）。
 func (t *Tx) RecordAuthAttempt(ts string, epochMs int64, sessionID, protocol, ip,
-	username, password string, success bool, location string) error {
-	return recordAuthAttempt(t, ts, epochMs, sessionID, protocol, ip, username, password, success, location)
+	username, password string, success bool, location, country string) error {
+	return recordAuthAttempt(t, ts, epochMs, sessionID, protocol, ip, username, password, success, location, country)
 }
 
 // RecordCommand 记录一条命令（事务内）。
@@ -645,6 +810,7 @@ type statsBump struct {
 	epochMs  int64
 	ip       string
 	location string
+	country  string // 国家段：只给归属地排行表用，明细表仍只存拼接后的 location
 	username string
 	password string
 	rank     bool
@@ -662,12 +828,13 @@ func recordSessionClose(e execer, ts, sessionID string, durationMs int64) error 
 }
 
 func recordAuthAttempt(e execer, ts string, epochMs int64, sessionID, protocol, ip,
-	username, password string, success bool, location string) error {
+	username, password string, success bool, location, country string) error {
 	return recordEvent(e, stmtAuthAttempt, statsBump{
 		ts:       ts,
 		epochMs:  epochMs,
 		ip:       ip,
 		location: location,
+		country:  country,
 		username: username,
 		password: password,
 		rank:     true,
@@ -740,7 +907,6 @@ func bumpRankings(e execer, b statsBump) error {
 	}{
 		{stmtUsername, "用户名", b.username},
 		{stmtPassword, "口令", b.password},
-		{stmtLocation, "归属地", b.location},
 	}
 	for _, item := range items {
 		stmt, err := e.statement(item.stmt)
@@ -750,6 +916,14 @@ func bumpRankings(e execer, b statsBump) error {
 		if _, err := stmt.Exec(item.value, 1); err != nil {
 			return fmt.Errorf("累加%s排行失败: %w", item.label, err)
 		}
+	}
+	// 归属地额外带国家段（user_version 7），多词国家名无法从 location 反推
+	locStmt, err := e.statement(stmtLocation)
+	if err != nil {
+		return err
+	}
+	if _, err := locStmt.Exec(b.location, b.country, 1); err != nil {
+		return fmt.Errorf("累加归属地排行失败: %w", err)
 	}
 	return nil
 }
@@ -782,19 +956,22 @@ func execStmt(e execer, key stmtKey, args ...any) error {
 // 分组判断让 user_version 4 的旧库升级时只回溯新增的排行表，不重复扫明细重建总量；
 // 聚合表被误删或手工清空也能自愈。全新空库（明细也为空）不做任何事。
 // 回溯在单事务内完成，崩溃不会留下半成品；user_version 由 init 在迁移成功后写入。
-func (s *Store) migrateStats() error {
+//
+// 返回值 rebuilt 表示排行表是否被重建（调用方据此判断是否需要回填 country）。
+func (s *Store) migrateStats() (rebuilt bool, err error) {
 	groups := []struct {
-		label   string
-		tables  []string
-		rebuild func() error
+		label    string
+		tables   []string
+		rankings bool // 排行组：重建后需要回填 country
+		rebuild  func() error
 	}{
-		{"总量统计", []string{"stats_daily", "stats_ip_daily"}, s.rebuildStats},
-		{"排行统计", []string{"stats_usernames", "stats_passwords", "stats_locations"}, s.rebuildRankings},
+		{"总量统计", []string{"stats_daily", "stats_ip_daily"}, false, s.rebuildStats},
+		{"排行统计", []string{"stats_usernames", "stats_passwords", "stats_locations"}, true, s.rebuildRankings},
 	}
 	for _, g := range groups {
 		need, err := s.statsMissing(g.tables)
 		if err != nil {
-			return err
+			return false, err
 		}
 		if !need {
 			continue
@@ -802,11 +979,14 @@ func (s *Store) migrateStats() error {
 		infof(s.logger, "预聚合"+g.label+"表需要从明细回溯重建（首次升级或聚合表被清空时发生），请稍候...")
 		start := time.Now()
 		if err := g.rebuild(); err != nil {
-			return err
+			return false, err
 		}
 		infof(s.logger, fmt.Sprintf("预聚合%s表已从明细回溯重建，耗时 %s", g.label, time.Since(start).Round(time.Millisecond)))
+		if g.rankings {
+			rebuilt = true
+		}
 	}
-	return nil
+	return rebuilt, nil
 }
 
 // statsMissing 这组聚合表全空但明细表有数据时返回 true（需要从明细回溯）。

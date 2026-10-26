@@ -29,8 +29,8 @@ var checkDBTables = []string{
 	"sys_audit_log",
 }
 
-// checkDBSchemaVersion 期望的 PRAGMA user_version（Go 版当前为 6）。
-const checkDBSchemaVersion = 6
+// checkDBSchemaVersion 期望的 PRAGMA user_version（Go 版当前为 7）。
+const checkDBSchemaVersion = 7
 
 // runCheckDB 只读自检数据库：版本号 + 12 张表行数，确认库结构可直接由当前 Go 版接续。
 //

@@ -46,6 +46,27 @@ func TestFormat(t *testing.T) {
 	}
 }
 
+// TestSplit 国家段必须与拼接后的归属地一起返回：多词国家名（South Korea）
+// 一旦与省份城市拼成一串就无法再切分，按国家聚合只能依赖这里单独保留的段。
+func TestSplit(t *testing.T) {
+	cases := []struct {
+		in   string
+		want Region
+	}{
+		{"中国|0|广东省|深圳市|电信", Region{Location: "中国 广东省 深圳市", Country: "中国"}},
+		{"美国|0|加利福尼亚州|0|Google", Region{Location: "美国 加利福尼亚州", Country: "美国"}},
+		{"South Korea|0|0|Seoul|0", Region{Location: "South Korea Seoul", Country: "South Korea"}},
+		{"0|0|0|0|0", Region{}},
+		{"", Region{}},
+		{"   ", Region{}},
+	}
+	for _, c := range cases {
+		if got := Split(c.in); got != c.want {
+			t.Errorf("Split(%q) = %+v, want %+v", c.in, got, c.want)
+		}
+	}
+}
+
 func TestIsPrivate(t *testing.T) {
 	private := []string{
 		"10.0.0.1", "10.255.255.255", "172.16.0.1", "172.31.255.255",
@@ -91,6 +112,14 @@ func TestLocateWithBuiltinDB(t *testing.T) {
 		t.Errorf("非法 IP = %q, want 空串", got)
 	}
 
+	// CountryOf 只取国家段：多词国家名必须完整，不能被截成首词
+	if got := l.CountryOf("10.1.2.3"); got != PrivateLabel {
+		t.Errorf("内网 IP 国家段 = %q, want %q", got, PrivateLabel)
+	}
+	if got := l.CountryOf("bad-ip"); got != "" {
+		t.Errorf("非法 IP 国家段 = %q, want 空串", got)
+	}
+
 	// 公网 IPv4：库中应能解析出国家（不校验具体省份，避免库版本升级导致断言脆弱）
 	loc := l.Locate("8.8.8.8")
 	if loc == "" {
@@ -119,6 +148,9 @@ func TestNilLocator(t *testing.T) {
 	}
 	if got := l.Locate("8.8.8.8"); got != "" {
 		t.Errorf("nil Locator.Locate = %q, want 空串", got)
+	}
+	if got := l.CountryOf("8.8.8.8"); got != "" {
+		t.Errorf("nil Locator.CountryOf = %q, want 空串", got)
 	}
 	l.Close()
 

@@ -56,7 +56,7 @@ func TestRunCheckDBSchemaOK(t *testing.T) {
 	}
 	text := out.String()
 	for _, want := range []string{
-		"schema OK (user_version=6)", "sessions", "stats_daily",
+		"schema OK (user_version=7)", "sessions", "stats_daily",
 		"stats_usernames", "stats_passwords", "stats_locations",
 		"sys_users", "sys_audit_log",
 	} {

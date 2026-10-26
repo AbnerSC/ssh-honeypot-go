@@ -63,10 +63,18 @@ type LogRepo struct {
 	// 回退路径会扫明细表全表（user_version 6 已退役口令/归属地索引，分组统计会慢到百毫秒级），
 	// 仅在聚合表缺失的异常库上发生。
 	agg bool
+	// locCountry stats_locations 带 country 列（user_version 7）；
+	// 缺失时只让地区排行回退到从 location 推断，其余统计仍走聚合表。
+	locCountry bool
 }
 
 func newLogRepo(db *sql.DB) *LogRepo {
-	return &LogRepo{db: db, cache: newStatCache(), agg: hasStatsTables(db)}
+	return &LogRepo{
+		db:         db,
+		cache:      newStatCache(),
+		agg:        hasStatsTables(db),
+		locCountry: hasColumn(db, "stats_locations", "country"),
+	}
 }
 
 // aggTables 预聚合统计表（user_version 4 的总量表 + 5 的排行表）。
@@ -85,6 +93,13 @@ func hasStatsTables(db *sql.DB) bool {
 	var n int
 	err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN (`+placeholders+`)`, args...).Scan(&n)
 	return err == nil && n == len(aggTables)
+}
+
+// hasColumn 探测表是否带指定列（旧库未迁移时缺列，如 stats_locations.country）。
+func hasColumn(db *sql.DB, table, column string) bool {
+	var n int
+	err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, table, column).Scan(&n)
+	return err == nil && n == 1
 }
 
 // sqlOverviewAgg 预聚合总览：只扫按天表（数十行）与按 IP 聚合表，不碰百万级明细。
@@ -300,12 +315,22 @@ func (l *LogRepo) TopPasswords(limit int) ([]map[string]any, error) {
 	})
 }
 
+// domesticCountry 国内归属地的国家段；国内再细分到省份，其余直接按国家聚合。
+const domesticCountry = "中国"
+
 // TopLocations 攻击源地区排行（国内按省份、国外按国家聚合，空值归入「未知」）。
+//
+// user_version 7 起优先用 stats_locations.country：location 是「国家 省份 城市」
+// 拼接串，多词国家名（South Korea、United States）按空格切分只能得到首词。
 func (l *LogRepo) TopLocations(limit int) ([]map[string]any, error) {
 	return cached(l.cache, "topLocations:"+strconv.Itoa(limit), func() ([]map[string]any, error) {
-		query := `SELECT location, COUNT(*) FROM auth_attempts GROUP BY location`
-		if l.agg {
-			query = `SELECT location, auth_attempts FROM stats_locations`
+		// 回退路径（旧库 / 独立测试库）没有 country 列，用空串占位后按 location 推断；
+		// 聚合表存在但缺列时同样只能按 location 推断（仅 1 次启动前的旧库会命中）
+		query := `SELECT location, '' AS country, COUNT(*) FROM auth_attempts GROUP BY location`
+		if l.agg && l.locCountry {
+			query = `SELECT location, country, auth_attempts FROM stats_locations`
+		} else if l.agg {
+			query = `SELECT location, '' AS country, auth_attempts FROM stats_locations`
 		}
 		rows, err := l.db.Query(query)
 		if err != nil {
@@ -317,12 +342,13 @@ func (l *LogRepo) TopLocations(limit int) ([]map[string]any, error) {
 		for rows.Next() {
 			var (
 				location sql.NullString
+				country  sql.NullString
 				count    int64
 			)
-			if err := rows.Scan(&location, &count); err != nil {
+			if err := rows.Scan(&location, &country, &count); err != nil {
 				return nil, fmt.Errorf("读取地区统计失败: %w", err)
 			}
-			byRegion[regionOf(location.String)] += count
+			byRegion[regionName(location.String, country.String)] += count
 		}
 		if err := rows.Err(); err != nil {
 			return nil, fmt.Errorf("读取地区统计失败: %w", err)
@@ -350,13 +376,32 @@ func (l *LogRepo) TopLocations(limit int) ([]map[string]any, error) {
 	})
 }
 
+// regionName 归属地聚合名：国内细分到省份，国外直接取国家；空值归入「未知」。
+//
+// country 为空串（旧库、回填失败、库无记录）时回退 regionOf，
+// 那种情况下多词国家名仍然会被截成首词（user_version 6 及以前的既有行为）。
+func regionName(location, country string) string {
+	country = strings.TrimSpace(country)
+	if country == "" {
+		return regionOf(location)
+	}
+	if country != domesticCountry {
+		return country
+	}
+	if parts := strings.Fields(location); len(parts) >= 2 {
+		return parts[1]
+	}
+	return country
+}
+
 // regionOf location（国家 省份 城市）取地区名：国内取省份，国外取国家；空值返回「未知」。
+// 仅用于没有国家段的回退路径（见 regionName）。
 func regionOf(location string) string {
 	parts := strings.Fields(location)
 	if len(parts) == 0 {
 		return "未知"
 	}
-	if parts[0] == "中国" && len(parts) >= 2 {
+	if parts[0] == domesticCountry && len(parts) >= 2 {
 		return parts[1]
 	}
 	return parts[0]

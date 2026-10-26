@@ -663,12 +663,13 @@ func TestLogRepoAggregateAndFallback(t *testing.T) {
 	ts := now.Format("2006-01-02 15:04:05.000")
 	epoch := now.UnixMilli()
 	const ip = "203.0.113.7"
+	// 多词国家名：location 拼接后只能取到首词，聚合名必须来自 country 列
 	for _, fn := range []func() error{
-		func() error { return st.RecordSessionOpen(ts, epoch, "s1-agg", "ssh", ip, 1234, "美国") },
+		func() error { return st.RecordSessionOpen(ts, epoch, "s1-agg", "ssh", ip, 1234, "South Korea Seoul") },
 		func() error {
-			return st.RecordAuthAttempt(ts, epoch, "s1-agg", "ssh", ip, "root", "x", false, "美国")
+			return st.RecordAuthAttempt(ts, epoch, "s1-agg", "ssh", ip, "root", "x", false, "South Korea Seoul", "South Korea")
 		},
-		func() error { return st.RecordCommand(ts, epoch, "s1-agg", ip, "root", "id", "美国") },
+		func() error { return st.RecordCommand(ts, epoch, "s1-agg", ip, "root", "id", "South Korea Seoul") },
 	} {
 		if err := fn(); err != nil {
 			t.Fatalf("写入事件失败: %v", err)
@@ -718,6 +719,14 @@ func TestLogRepoAggregateAndFallback(t *testing.T) {
 		t.Errorf("聚合 IP 排行不符: %v", topIPs)
 	}
 
+	topLocations, err := repo.TopLocations(5)
+	if err != nil {
+		t.Fatalf("地区排行失败: %v", err)
+	}
+	if len(topLocations) != 1 || topLocations[0]["name"] != "South Korea" || toInt64(topLocations[0]["value"]) != 1 {
+		t.Errorf("地区排行应按国家聚合为 South Korea，实际: %v", topLocations)
+	}
+
 	// 回退路径：聚合表缺失时仍能统计明细（防御性兜底）
 	writeDB, err := openWriteDB(dbPath)
 	if err != nil {
@@ -743,5 +752,64 @@ func TestLogRepoAggregateAndFallback(t *testing.T) {
 	}
 	if got := toInt64(overview["todayCommands"]); got != 1 {
 		t.Errorf("回退总览 todayCommands = %d, want 1", got)
+	}
+}
+
+// TestTopLocationsWithoutCountryColumn 聚合表存在但缺 country 列（升级前的 v6 库）时，
+// 只能让地区排行退化为按 location 首段推断，其余统计仍走聚合表。
+func TestTopLocationsWithoutCountryColumn(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	dbPath := filepath.Join(t.TempDir(), "database.db")
+
+	st, err := store.Open(dbPath, logger)
+	if err != nil {
+		t.Fatalf("初始化攻击日志表失败: %v", err)
+	}
+	now := time.Now()
+	if err := st.RecordAuthAttempt(now.Format("2006-01-02 15:04:05.000"), now.UnixMilli(),
+		"s1", "ssh", "203.0.113.7", "root", "x", false, "South Korea Seoul", "South Korea"); err != nil {
+		t.Fatalf("写入事件失败: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("关闭失败: %v", err)
+	}
+
+	// 退化成 v6 结构：stats_locations 没有 country 列
+	w, err := openWriteDB(dbPath)
+	if err != nil {
+		t.Fatalf("打开写库失败: %v", err)
+	}
+	for _, ddl := range []string{
+		`DROP TABLE stats_locations`,
+		`CREATE TABLE stats_locations (location TEXT NOT NULL PRIMARY KEY, auth_attempts INTEGER NOT NULL DEFAULT 0)`,
+		`INSERT INTO stats_locations(location, auth_attempts) VALUES('South Korea Seoul', 1)`,
+	} {
+		if _, err := w.Exec(ddl); err != nil {
+			t.Fatalf("构造 v6 库失败（%s）: %v", ddl, err)
+		}
+	}
+	_ = w.Close()
+
+	db, err := openReadDB(dbPath)
+	if err != nil {
+		t.Fatalf("打开只读库失败: %v", err)
+	}
+	defer db.Close()
+
+	repo := newLogRepo(db)
+	if !repo.agg || repo.locCountry {
+		t.Fatalf("聚合路径应仍启用但缺 country 列: agg=%t locCountry=%t", repo.agg, repo.locCountry)
+	}
+	// 其余统计不受影响，仍读聚合表
+	if _, err := repo.Overview(); err != nil {
+		t.Fatalf("总览统计失败: %v", err)
+	}
+	// 缺 country 列时只能按空格取首段（升级前的既有行为），升级到 v7 后应变为 South Korea
+	top, err := repo.TopLocations(5)
+	if err != nil {
+		t.Fatalf("地区排行失败: %v", err)
+	}
+	if len(top) != 1 || top[0]["name"] != "South" {
+		t.Errorf("缺 country 列时应退化为首段推断，实际: %v", top)
 	}
 }

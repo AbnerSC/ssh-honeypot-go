@@ -51,12 +51,23 @@ type Locator struct {
 	mu    sync.Mutex
 	v4    *xdb.Searcher
 	v6    *xdb.Searcher
-	cache map[string]string
+	cache map[string]Region
+}
+
+// Region 一次归属地解析的结果。
+//
+// 除拼好的 Location 外单独保留国家段：多词国家名（South Korea、United States）
+// 一旦和省份城市拼成一串就无法再可靠切分，按国家聚合只能用这里的原始段。
+type Region struct {
+	// Location 「国家 省份 城市」，与 Format 输出一致。
+	Location string
+	// Country 国家段原文；无记录或国家段为空 / 0 时为空串。
+	Country string
 }
 
 // Load 打开内置 v4/v6 库并构造定位器；单侧加载失败仅告警并降级，不返回错误。
 func Load(logger *slog.Logger) *Locator {
-	l := &Locator{cache: make(map[string]string, cacheLimit)}
+	l := &Locator{cache: make(map[string]Region, cacheLimit)}
 
 	if s, err := openBuiltin(builtinV4, xdb.IPv4, probeV4); err != nil {
 		warnf(logger, "v4 IP 归属地库不可用，v4 归属地留空: "+err.Error())
@@ -114,15 +125,26 @@ func (l *Locator) Available() bool {
 // Locate 解析 IP 归属地为「国家 省份 城市」。
 // 库不可用、地址非法或库中无记录时返回空串；内网地址返回 PrivateLabel。
 func (l *Locator) Locate(ip string) string {
+	return l.LocateRegion(ip).Location
+}
+
+// CountryOf 只取国家段（按国家聚合用）；解析失败返回空串。
+func (l *Locator) CountryOf(ip string) string {
+	return l.LocateRegion(ip).Country
+}
+
+// LocateRegion 解析 IP 归属地，同时返回国家段。
+// 库不可用、地址非法或库中无记录时返回零值；内网地址返回 PrivateLabel。
+func (l *Locator) LocateRegion(ip string) Region {
 	if l == nil || (l.v4 == nil && l.v6 == nil) {
-		return ""
+		return Region{}
 	}
 	key := strings.TrimSpace(ip)
 	if key == "" {
-		return ""
+		return Region{}
 	}
 	if IsPrivate(key) {
-		return PrivateLabel
+		return Region{Location: PrivateLabel, Country: PrivateLabel}
 	}
 
 	l.mu.Lock()
@@ -130,32 +152,32 @@ func (l *Locator) Locate(ip string) string {
 	if cached, ok := l.cache[key]; ok {
 		return cached
 	}
-	location := l.search(key)
+	region := l.search(key)
 	// 达上限后仅查询不缓存，避免异常流量撑爆内存
 	if len(l.cache) < cacheLimit {
-		l.cache[key] = location
+		l.cache[key] = region
 	}
-	return location
+	return region
 }
 
-// search 按 IP 版本选择对应库检索；未加载的版本直接返回空串。
-func (l *Locator) search(ip string) string {
+// search 按 IP 版本选择对应库检索；未加载的版本直接返回零值。
+func (l *Locator) search(ip string) Region {
 	parsed := net.ParseIP(ip)
 	if parsed == nil {
-		return ""
+		return Region{}
 	}
 	searcher := l.v6
 	if parsed.To4() != nil {
 		searcher = l.v4
 	}
 	if searcher == nil {
-		return ""
+		return Region{}
 	}
 	region, err := searcher.Search(ip)
 	if err != nil {
-		return ""
+		return Region{}
 	}
-	return Format(region)
+	return Split(region)
 }
 
 // Close 关闭检索器并释放缓存。
@@ -173,24 +195,28 @@ func (l *Locator) Close() {
 		l.v6.Close()
 		l.v6 = nil
 	}
-	l.cache = make(map[string]string)
+	l.cache = make(map[string]Region)
 }
 
-// Format 把「国家|区域|省份|城市|ISP」整理为「国家 省份 城市」：
+// Split 解析 xdb 的「国家|区域|省份|城市|ISP」原文，返回国家段与整理后的归属地。
 // 跳过 0 占位符与空段，并合并相邻重复段（如「上海 上海」）。
-func Format(region string) string {
+func Split(region string) Region {
 	if strings.TrimSpace(region) == "" {
-		return ""
+		return Region{}
 	}
 	parts := strings.Split(region, "|")
+	r := Region{}
+	if len(parts) > 0 {
+		r.Country = segment(parts[0])
+	}
 	var b strings.Builder
 	last := ""
 	for _, idx := range regionIdx {
 		if idx >= len(parts) {
 			break
 		}
-		v := strings.TrimSpace(parts[idx])
-		if v == "" || v == "0" || v == last {
+		v := segment(parts[idx])
+		if v == "" || v == last {
 			continue
 		}
 		if b.Len() > 0 {
@@ -199,7 +225,22 @@ func Format(region string) string {
 		b.WriteString(v)
 		last = v
 	}
-	return b.String()
+	r.Location = b.String()
+	return r
+}
+
+// Format 把「国家|区域|省份|城市|ISP」整理为「国家 省份 城市」。
+func Format(region string) string {
+	return Split(region).Location
+}
+
+// segment 取单个分段：去空白，0 占位符视为空段。
+func segment(s string) string {
+	v := strings.TrimSpace(s)
+	if v == "0" {
+		return ""
+	}
+	return v
 }
 
 // IsPrivate 识别内网 / 环回 / 链路本地地址（IPv4 + IPv6），命中后无需检索库。

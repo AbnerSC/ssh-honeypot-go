@@ -156,6 +156,25 @@ func TestDiffIgnoresGoExtensionTables(t *testing.T) {
 	}
 }
 
+// TestDiffIgnoresRetiredIndexes Go 版退役的索引不应报成「仅 Java 版存在」。
+func TestDiffIgnoresRetiredIndexes(t *testing.T) {
+	javaPath := newDB(t, 3, ddlSessions, ddlAuth, idxAuthSrcIP,
+		`CREATE INDEX idx_auth_password ON auth_attempts(ts)`,
+		`CREATE INDEX idx_auth_location ON auth_attempts(ts)`)
+	goPath := newDB(t, 6, ddlSessions, ddlAuth, idxAuthSrcIP)
+
+	if diffs := Diff(mustLoad(t, javaPath), mustLoad(t, goPath)); len(diffs) != 0 {
+		t.Fatalf("退役索引不应产生差异，实际: %v", diffs)
+	}
+
+	// 非退役索引仍有差异时不能被跳过
+	javaPath2 := newDB(t, 3, ddlSessions, ddlAuth, `CREATE INDEX idx_auth_ts ON auth_attempts(ts)`)
+	joined := strings.Join(Diff(mustLoad(t, javaPath2), mustLoad(t, goPath)), "\n")
+	if !strings.Contains(joined, "索引 idx_auth_ts：仅 Java 版存在") {
+		t.Fatalf("未退役索引的缺失必须报出，实际:\n%s", joined)
+	}
+}
+
 func TestLoadSchemaMissingFile(t *testing.T) {
 	if _, err := LoadSchema(filepath.Join(t.TempDir(), "nope.db")); err == nil {
 		t.Fatal("文件不存在时应报错（mode=ro 不建库）")

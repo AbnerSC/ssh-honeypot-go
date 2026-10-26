@@ -206,8 +206,19 @@ func loadIndex(db *sql.DB, name string) (Index, error) {
 // ExtensionTables Go 版新增的扩展表（预聚合统计）。
 // Java 版没有这些表，遍历时跳过：它们属于纯增量扩展，不参与结构契约。
 var ExtensionTables = map[string]bool{
-	"stats_daily":    true,
-	"stats_ip_daily": true,
+	"stats_daily":     true,
+	"stats_ip_daily":  true,
+	"stats_usernames": true,
+	"stats_passwords": true,
+	"stats_locations": true,
+}
+
+// RetiredIndexes Go 版已退役的索引（user_version 6 起迁移时 DROP）。
+// 这些索引的数据已由聚合表接管，Go 版不再依赖它们；与存量 Java 库比对时
+// 按「仅 Java 版存在」跳过，避免把正常退役报成结构差异。
+var RetiredIndexes = map[string]bool{
+	"idx_auth_password": true,
+	"idx_auth_location": true,
 }
 
 // Diff 比对两份结构快照，返回人类可读的差异清单（空切片表示一致）。
@@ -322,6 +333,9 @@ func diffTable(name string, java, goTable Table) []string {
 		gi, gok := gIdx[iname]
 		switch {
 		case !gok:
+			if RetiredIndexes[iname] {
+				continue
+			}
 			diffs = append(diffs, fmt.Sprintf("表 %s 索引 %s：仅 Java 版存在", name, iname))
 		case !jok:
 			diffs = append(diffs, fmt.Sprintf("表 %s 索引 %s：仅 Go 版存在", name, iname))

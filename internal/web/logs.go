@@ -11,8 +11,8 @@ import (
 )
 
 // statsTTL 统计接口结果缓存有效期。
-// Dashboard 每次切入会并发拉取 7 个统计接口：总览/趋势/IP 排行已走预聚合表，
-// 用户名/口令/地区排行仍扫明细覆盖索引，短 TTL 缓存可合并并发请求的重复查询。
+// Dashboard 每次切入会并发拉取 7 个统计接口，全部走预聚合表（不会扫明细表）；
+// 短 TTL 缓存可合并并发请求的重复查询。
 const statsTTL = 60 * time.Second
 
 // statCache 统计结果 TTL 缓存（键含当日日期，跨日 midnight 后自动失效）。
@@ -59,7 +59,9 @@ type LogRepo struct {
 	db    *sql.DB
 	cache *statCache
 	// agg 预聚合统计表可用（store 建表成功）。
-	// 旧库或独立测试库缺失时回退到明细表全量统计，保证控制台不白屏。
+	// 旧库或独立测试库缺失时回退到明细表全量统计，保证控制台不白屏；
+	// 回退路径会扫明细表全表（user_version 6 已退役口令/归属地索引，分组统计会慢到百毫秒级），
+	// 仅在聚合表缺失的异常库上发生。
 	agg bool
 }
 
@@ -67,11 +69,22 @@ func newLogRepo(db *sql.DB) *LogRepo {
 	return &LogRepo{db: db, cache: newStatCache(), agg: hasStatsTables(db)}
 }
 
-// hasStatsTables 探测预聚合统计表是否存在；探测失败按不可用处理（回退明细统计）。
+// aggTables 预聚合统计表（user_version 4 的总量表 + 5 的排行表）。
+var aggTables = []string{
+	"stats_daily", "stats_ip_daily",
+	"stats_usernames", "stats_passwords", "stats_locations",
+}
+
+// hasStatsTables 探测预聚合统计表是否全部存在；探测失败按不可用处理（回退明细统计）。
 func hasStatsTables(db *sql.DB) bool {
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(aggTables)), ",")
+	args := make([]any, len(aggTables))
+	for i, name := range aggTables {
+		args[i] = name
+	}
 	var n int
-	err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('stats_daily','stats_ip_daily')`).Scan(&n)
-	return err == nil && n == 2
+	err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN (`+placeholders+`)`, args...).Scan(&n)
+	return err == nil && n == len(aggTables)
 }
 
 // sqlOverviewAgg 预聚合总览：只扫按天表（数十行）与按 IP 聚合表，不碰百万级明细。
@@ -266,6 +279,10 @@ func (l *LogRepo) TopIPs(limit int) ([]map[string]any, error) {
 // TopUsernames 被爆破用户名排行。
 func (l *LogRepo) TopUsernames(limit int) ([]map[string]any, error) {
 	return cached(l.cache, "topUsernames:"+strconv.Itoa(limit), func() ([]map[string]any, error) {
+		if l.agg {
+			return l.listLimit(`SELECT username AS name, auth_attempts AS value FROM stats_usernames
+				ORDER BY value DESC, name LIMIT ?`, limit)
+		}
 		return l.listLimit(`SELECT username AS name, COUNT(*) AS value FROM auth_attempts
 			GROUP BY username ORDER BY value DESC LIMIT ?`, limit)
 	})
@@ -274,6 +291,10 @@ func (l *LogRepo) TopUsernames(limit int) ([]map[string]any, error) {
 // TopPasswords 被尝试口令排行。
 func (l *LogRepo) TopPasswords(limit int) ([]map[string]any, error) {
 	return cached(l.cache, "topPasswords:"+strconv.Itoa(limit), func() ([]map[string]any, error) {
+		if l.agg {
+			return l.listLimit(`SELECT password AS name, auth_attempts AS value FROM stats_passwords
+				ORDER BY value DESC, name LIMIT ?`, limit)
+		}
 		return l.listLimit(`SELECT password AS name, COUNT(*) AS value FROM auth_attempts
 			GROUP BY password ORDER BY value DESC LIMIT ?`, limit)
 	})
@@ -284,8 +305,7 @@ func (l *LogRepo) TopLocations(limit int) ([]map[string]any, error) {
 	return cached(l.cache, "topLocations:"+strconv.Itoa(limit), func() ([]map[string]any, error) {
 		query := `SELECT location, COUNT(*) FROM auth_attempts GROUP BY location`
 		if l.agg {
-			query = `SELECT location, SUM(auth_attempts) FROM stats_ip_daily
-				WHERE auth_attempts > 0 GROUP BY location`
+			query = `SELECT location, auth_attempts FROM stats_locations`
 		}
 		rows, err := l.db.Query(query)
 		if err != nil {

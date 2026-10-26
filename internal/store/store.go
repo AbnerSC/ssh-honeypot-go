@@ -13,8 +13,11 @@
 // 单写入协程串行调用，因此无需额外加锁；WAL 模式允许 Web 端只读连接并发查询而不阻塞写入。
 //
 // 预聚合统计：在明细表之外新增 stats_daily / stats_ip_daily（user_version 4），
-// 每次事件写入时用两条 UPSERT 累加（按天 + 按天&来源 IP），
-// Web 端统计接口直接读聚合结果，不再对百万级明细表做全表 COUNT / GROUP BY。
+// 每次事件写入时用两条 UPSERT 累加（按天 + 按天&来源 IP）；
+// user_version 5 再补 stats_usernames / stats_passwords / stats_locations 三张累计排行表。
+// Web 端统计接口直接读聚合结果，不再对百万级明细表做全表 COUNT / GROUP BY；
+// 排行表不带 day 维度：排行榜只按累计次数排序，按天再拆只会把行数放大到「天数 × 去重值」。
+// user_version 6 退役明细表上的口令 / 归属地索引（见 schemaRetiredIndexes）。
 //
 // init 中的建表与数据迁移都是幂等的，全部成功后才写入 user_version；Go 版是唯一实现，
 // 升级后不回退到 Java 版，因此版本号可以正常递增（见 schemaVersion）。
@@ -34,12 +37,14 @@ import (
 
 // schemaVersion 当前数据库版本（PRAGMA user_version）。
 // 1：初始表结构；2：sessions 增加 location；3：其余含来源 IP 的事件表增加 location；
-// 4：新增预聚合统计表 stats_daily / stats_ip_daily。
+// 4：新增预聚合统计表 stats_daily / stats_ip_daily；
+// 5：新增累计排行表 stats_usernames / stats_passwords / stats_locations；
+// 6：退役 auth_attempts(password) / auth_attempts(location) 两条明细索引。
 //
 // Go 版是唯一实现，升级后不再回退到 Java 版，因此版本号按需正常递增。
 // 版本号标识库结构代次（供 checkdb 与运维自检）；数据迁移的触发条件则由
 // migrateStats 依据聚合表与明细表的实际状态判断，不依赖版本号。
-const schemaVersion = 4
+const schemaVersion = 6
 
 // schemaTables 建表语句（幂等）。数据库版本通过 user_version 管理，便于以后迁移。
 var schemaTables = []string{
@@ -125,10 +130,31 @@ CREATE TABLE IF NOT EXISTS stats_ip_daily (
     updated_epoch_ms INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (day, src_ip)
 )`,
+	// user_version 5：按「用户名 / 口令 / 归属地」的累计排行表（登录尝试维度）。
+	// 键取去重后的取值，行数与尝试次数无关；归属地空串单独成键（Web 端归入「未知」）。
+	`
+CREATE TABLE IF NOT EXISTS stats_usernames (
+    username         TEXT    NOT NULL PRIMARY KEY,
+    auth_attempts    INTEGER NOT NULL DEFAULT 0
+)`,
+	`
+CREATE TABLE IF NOT EXISTS stats_passwords (
+    password         TEXT    NOT NULL PRIMARY KEY,
+    auth_attempts    INTEGER NOT NULL DEFAULT 0
+)`,
+	`
+CREATE TABLE IF NOT EXISTS stats_locations (
+    location         TEXT    NOT NULL PRIMARY KEY,   -- 归属地原文（国家 省份 城市），空串表示未知
+    auth_attempts    INTEGER NOT NULL DEFAULT 0
+)`,
 }
 
 // schemaIndexes 建索引语句（幂等）。必须在补列迁移之后执行：
 // 旧库（user_version<3）的事件表没有 location 列，提前建索引会报 no such column。
+//
+// 只建被查询实际命中的索引。src_ip / username / ts 三类索引看似「只给 LIKE 用」，
+// 但 SQLite 会把它们当作**覆盖索引扫描**：`WHERE src_ip LIKE '%x%'` 虽然无法用索引定位，
+// 却可以只扫窄索引而不读整行宽表（实测登录表计数 133ms vs 全表 213ms），因此保留。
 var schemaIndexes = []string{
 	`CREATE INDEX IF NOT EXISTS idx_sessions_src_ip ON sessions(src_ip)`,
 	`CREATE INDEX IF NOT EXISTS idx_sessions_opened ON sessions(opened_epoch_ms)`,
@@ -137,9 +163,6 @@ var schemaIndexes = []string{
 	`CREATE INDEX IF NOT EXISTS idx_auth_src_ip ON auth_attempts(src_ip)`,
 	`CREATE INDEX IF NOT EXISTS idx_auth_username ON auth_attempts(username)`,
 	`CREATE INDEX IF NOT EXISTS idx_auth_ts ON auth_attempts(ts_epoch_ms)`,
-	// 口令排行 / 地区排行统计走覆盖索引，避免大表全表扫描
-	`CREATE INDEX IF NOT EXISTS idx_auth_password ON auth_attempts(password)`,
-	`CREATE INDEX IF NOT EXISTS idx_auth_location ON auth_attempts(location)`,
 	`CREATE INDEX IF NOT EXISTS idx_commands_session ON commands(session_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_commands_src_ip ON commands(src_ip)`,
 	`CREATE INDEX IF NOT EXISTS idx_commands_ts ON commands(ts_epoch_ms)`,
@@ -149,6 +172,19 @@ var schemaIndexes = []string{
 	`CREATE INDEX IF NOT EXISTS idx_ip_locks_ts ON ip_locks(ts_epoch_ms)`,
 	// 聚合表按 IP 排行：覆盖索引避免扫描全表
 	`CREATE INDEX IF NOT EXISTS idx_stats_ip_daily_ip ON stats_ip_daily(src_ip, auth_attempts)`,
+}
+
+// schemaRetiredIndexes 退役索引（user_version 6）：建表建索引之后从老库里删除。
+//
+// 口令 / 归属地排行改由 stats_passwords / stats_locations 承担，明细表上的这两条
+// 索引只剩「聚合表缺失时回退到明细统计」这一条路径会用到，代价却很高：
+// 120 万条事件下 idx_auth_location 占 22.0MB、idx_auth_password 占 12.0MB，
+// 其中 location 是高基数长字符串，索引几乎与数据本身等大。
+// 实测删除后控制台查询无回归（聚合路径不读它们）；只有聚合表缺失的异常库回退统计
+// 会退化成全表扫描（实测 70 万条登录记录下由 60–70ms 升到 620–830ms），该路径本身只用于兼容旧库。
+var schemaRetiredIndexes = []string{
+	`DROP INDEX IF EXISTS idx_auth_password`,
+	`DROP INDEX IF EXISTS idx_auth_location`,
 }
 
 // locationTables 需要 location 列的事件表（user_version 3 起的迁移目标）。
@@ -191,10 +227,22 @@ ON CONFLICT(day, src_ip) DO UPDATE SET
     ip_locks         = ip_locks + excluded.ip_locks,
     location         = COALESCE(stats_ip_daily.location, excluded.location),
     updated_epoch_ms = excluded.updated_epoch_ms`
+
+	// sqlUpsertUsername / sqlUpsertPassword / sqlUpsertLocation 排行累加（user_version 5）：
+	// 只有登录尝试事件写入；命中主键后累加，代价与表规模无关。
+	sqlUpsertUsername = `INSERT INTO stats_usernames(username, auth_attempts) VALUES(?,?)
+ON CONFLICT(username) DO UPDATE SET auth_attempts = auth_attempts + excluded.auth_attempts`
+
+	sqlUpsertPassword = `INSERT INTO stats_passwords(password, auth_attempts) VALUES(?,?)
+ON CONFLICT(password) DO UPDATE SET auth_attempts = auth_attempts + excluded.auth_attempts`
+
+	sqlUpsertLocation = `INSERT INTO stats_locations(location, auth_attempts) VALUES(?,?)
+ON CONFLICT(location) DO UPDATE SET auth_attempts = auth_attempts + excluded.auth_attempts`
 )
 
-// 回填 SQL：把五张明细表的增量用 UNION ALL 归一到同一形状，再按天（或天+IP）汇总。
-// 只在首次升级（user_version<4）或聚合表被清空时执行一次，单事务提交，崩溃不会留下半成品。
+// 回填 SQL：把五张明细表的增量用 UNION ALL 归一到同一形状，再按天（或天+IP）汇总；
+// 排行表回填只扫 auth_attempts。
+// 只在首次升级（缺少对应聚合表）或聚合表被清空时执行一次，单事务提交，崩溃不会留下半成品。
 var (
 	sqlBackfillDaily = `
 INSERT INTO stats_daily(day, sessions, auth_attempts, commands, downloads, ip_locks, updated_epoch_ms)
@@ -221,6 +269,25 @@ FROM (
 )
 WHERE day <> '' AND src_ip <> ''
 GROUP BY day, src_ip`
+
+	// 排行表回溯：只扫 auth_attempts，按去重取值汇总；
+	// 归属地用 COALESCE 把 NULL 归入空串键，与写入路径的口径保持一致。
+	sqlBackfillUsernames = `
+INSERT INTO stats_usernames(username, auth_attempts)
+SELECT username, COUNT(*) FROM auth_attempts
+WHERE username <> ''
+GROUP BY username`
+
+	sqlBackfillPasswords = `
+INSERT INTO stats_passwords(password, auth_attempts)
+SELECT password, COUNT(*) FROM auth_attempts
+WHERE password <> ''
+GROUP BY password`
+
+	sqlBackfillLocations = `
+INSERT INTO stats_locations(location, auth_attempts)
+SELECT COALESCE(location, ''), COUNT(*) FROM auth_attempts
+GROUP BY COALESCE(location, '')`
 )
 
 // stmtKey 预编译语句编号，避免在热路径上按字符串查表。
@@ -235,6 +302,9 @@ const (
 	stmtIPLocked
 	stmtDaily
 	stmtIPDaily
+	stmtUsername
+	stmtPassword
+	stmtLocation
 	stmtCount
 )
 
@@ -324,6 +394,14 @@ func (s *Store) init() error {
 		}
 	}
 
+	// 退役索引在索引创建之后清理：老库上它们仍然存在，DROP 是幂等的。
+	for _, ddl := range schemaRetiredIndexes {
+		if _, err := s.db.Exec(ddl); err != nil {
+			return fmt.Errorf("清理退役索引失败: %w", err)
+		}
+	}
+	s.reportFreePages()
+
 	// 崩溃恢复：进程启动即意味着上次的连接已全部消失，把残留的未关闭会话补齐，
 	// 否则 Web 控制台的「在线会话」会永久留在在线状态。
 	if _, err := s.db.Exec(sqlCloseOrphanSessions); err != nil {
@@ -336,8 +414,9 @@ func (s *Store) init() error {
 		return fmt.Errorf("清理过渡表 stats_meta 失败: %w", err)
 	}
 
-	// 版本迁移：user_version 4 引入预聚合统计表，旧库需要从明细回溯历史数据。
-	// 必须在写入 user_version 之前完成，中途失败时下次启动会重试。
+	// 版本迁移：user_version 4 引入按天/按 IP 聚合表，5 引入排行表；
+	// 旧库需要从明细回溯历史数据。必须在写入 user_version 之前完成，
+	// 中途失败时下次启动会重试。
 	if err := s.migrateStats(); err != nil {
 		return err
 	}
@@ -346,6 +425,21 @@ func (s *Store) init() error {
 		return fmt.Errorf("写入数据库版本失败: %w", err)
 	}
 	return nil
+}
+
+// reportFreePages 删除退役索引释放的页会留在文件里（SQLite 不会自动缩小文件），
+// 空闲页超过 8MB 时提示一次；VACUUM 需要独占写锁且耗时随库体积增长，不在启动路径自动执行。
+func (s *Store) reportFreePages() {
+	var pages, pageSize int64
+	if err := s.db.QueryRow(`PRAGMA freelist_count`).Scan(&pages); err != nil {
+		return
+	}
+	if err := s.db.QueryRow(`PRAGMA page_size`).Scan(&pageSize); err != nil {
+		return
+	}
+	if free := pages * pageSize; free > 8<<20 {
+		infof(s.logger, fmt.Sprintf("库内空闲页约 %d MB（退役索引释放），可离线执行 VACUUM 回收磁盘", free>>20))
+	}
 }
 
 // ensureColumn 列不存在时补加，失败仅告警（不阻塞启动）。
@@ -401,6 +495,9 @@ func (s *Store) prepare() error {
 		stmtIPLocked:     sqlInsertIpLock,
 		stmtDaily:        sqlUpsertDaily,
 		stmtIPDaily:      sqlUpsertIPDaily,
+		stmtUsername:     sqlUpsertUsername,
+		stmtPassword:     sqlUpsertPassword,
+		stmtLocation:     sqlUpsertLocation,
 	}
 	for key, query := range queries {
 		stmt, err := s.db.Prepare(query)
@@ -541,8 +638,22 @@ type statsDelta struct {
 	sessions, authAttempts, commands, downloads, ipLocks int
 }
 
+// statsBump 一次事件要累加的统计目标与增量。
+// rank 为 true 时才累加用户名 / 口令 / 归属地排行（只有登录尝试事件需要）。
+type statsBump struct {
+	ts       string
+	epochMs  int64
+	ip       string
+	location string
+	username string
+	password string
+	rank     bool
+	delta    statsDelta
+}
+
 func recordSessionOpen(e execer, ts string, epochMs int64, sessionID, protocol, ip string, port int, location string) error {
-	return recordEvent(e, stmtSessionOpen, ts, epochMs, ip, location, statsDelta{sessions: 1},
+	return recordEvent(e, stmtSessionOpen,
+		statsBump{ts: ts, epochMs: epochMs, ip: ip, location: location, delta: statsDelta{sessions: 1}},
 		sessionID, protocol, ip, port, ts, epochMs, nullable(location))
 }
 
@@ -552,54 +663,93 @@ func recordSessionClose(e execer, ts, sessionID string, durationMs int64) error 
 
 func recordAuthAttempt(e execer, ts string, epochMs int64, sessionID, protocol, ip,
 	username, password string, success bool, location string) error {
-	return recordEvent(e, stmtAuthAttempt, ts, epochMs, ip, location, statsDelta{authAttempts: 1},
+	return recordEvent(e, stmtAuthAttempt, statsBump{
+		ts:       ts,
+		epochMs:  epochMs,
+		ip:       ip,
+		location: location,
+		username: username,
+		password: password,
+		rank:     true,
+		delta:    statsDelta{authAttempts: 1},
+	},
 		ts, epochMs, nullable(sessionID), nullable(protocol), ip, username, password, boolToInt(success), nullable(location))
 }
 
 func recordCommand(e execer, ts string, epochMs int64, sessionID, ip, username, cmdline, location string) error {
-	return recordEvent(e, stmtCommand, ts, epochMs, ip, location, statsDelta{commands: 1},
+	return recordEvent(e, stmtCommand,
+		statsBump{ts: ts, epochMs: epochMs, ip: ip, location: location, delta: statsDelta{commands: 1}},
 		ts, epochMs, nullable(sessionID), ip, nullable(username), cmdline, nullable(location))
 }
 
 func recordDownload(e execer, ts string, epochMs int64, sessionID, ip, username, url, location string) error {
-	return recordEvent(e, stmtDownload, ts, epochMs, ip, location, statsDelta{downloads: 1},
+	return recordEvent(e, stmtDownload,
+		statsBump{ts: ts, epochMs: epochMs, ip: ip, location: location, delta: statsDelta{downloads: 1}},
 		ts, epochMs, nullable(sessionID), ip, nullable(username), url, nullable(location))
 }
 
 func recordIPLocked(e execer, ts string, epochMs int64, ip, until, location string) error {
-	return recordEvent(e, stmtIPLocked, ts, epochMs, ip, location, statsDelta{ipLocks: 1},
+	return recordEvent(e, stmtIPLocked,
+		statsBump{ts: ts, epochMs: epochMs, ip: ip, location: location, delta: statsDelta{ipLocks: 1}},
 		ts, epochMs, ip, until, nullable(location))
 }
 
 // recordEvent 先写明细再累加聚合：明细失败则不累加，保证两者可对账。
-func recordEvent(e execer, key stmtKey, ts string, epochMs int64, ip, location string,
-	d statsDelta, args ...any) error {
+func recordEvent(e execer, key stmtKey, b statsBump, args ...any) error {
 	if err := execStmt(e, key, args...); err != nil {
 		return err
 	}
-	return bumpStats(e, ts, epochMs, ip, location, d)
+	return bumpStats(e, b)
 }
 
-// bumpStats 累加预聚合计数：按天与按天&IP 各一条 UPSERT（命中主键，代价与表规模无关）。
-func bumpStats(e execer, ts string, epochMs int64, ip, location string, d statsDelta) error {
-	day := dayOf(ts)
-	if day == "" || ip == "" {
+// bumpStats 累加预聚合计数：按天与按天&IP 各一条 UPSERT（命中主键，代价与表规模无关）；
+// 登录尝试再累加用户名 / 口令 / 归属地三张累计排行表。
+func bumpStats(e execer, b statsBump) error {
+	day := dayOf(b.ts)
+	if day == "" || b.ip == "" {
 		return nil
 	}
 	daily, err := e.statement(stmtDaily)
 	if err != nil {
 		return err
 	}
-	if _, err := daily.Exec(day, d.sessions, d.authAttempts, d.commands, d.downloads, d.ipLocks, epochMs); err != nil {
+	if _, err := daily.Exec(day, b.delta.sessions, b.delta.authAttempts, b.delta.commands, b.delta.downloads, b.delta.ipLocks, b.epochMs); err != nil {
 		return fmt.Errorf("累加按天统计失败: %w", err)
 	}
 	ipDaily, err := e.statement(stmtIPDaily)
 	if err != nil {
 		return err
 	}
-	if _, err := ipDaily.Exec(day, ip, d.sessions, d.authAttempts, d.commands, d.downloads, d.ipLocks,
-		nullable(location), epochMs); err != nil {
+	if _, err := ipDaily.Exec(day, b.ip, b.delta.sessions, b.delta.authAttempts, b.delta.commands, b.delta.downloads, b.delta.ipLocks,
+		nullable(b.location), b.epochMs); err != nil {
 		return fmt.Errorf("累加按 IP 统计失败: %w", err)
+	}
+	if !b.rank {
+		return nil
+	}
+	return bumpRankings(e, b)
+}
+
+// bumpRankings 累加用户名 / 口令 / 归属地排行。
+// 归属地空串单独成键（对应 Web 端的「未知」分组），因此不做空值跳过。
+func bumpRankings(e execer, b statsBump) error {
+	items := []struct {
+		stmt  stmtKey
+		label string
+		value string
+	}{
+		{stmtUsername, "用户名", b.username},
+		{stmtPassword, "口令", b.password},
+		{stmtLocation, "归属地", b.location},
+	}
+	for _, item := range items {
+		stmt, err := e.statement(item.stmt)
+		if err != nil {
+			return err
+		}
+		if _, err := stmt.Exec(item.value, 1); err != nil {
+			return fmt.Errorf("累加%s排行失败: %w", item.label, err)
+		}
 	}
 	return nil
 }
@@ -625,39 +775,52 @@ func execStmt(e execer, key stmtKey, args ...any) error {
 
 // migrateStats 保证预聚合统计表与明细表一致。
 //
-// 需要从明细回溯的唯一实质条件是「聚合表为空而明细表有数据」，它覆盖两种场景：
-//   - 首次升级到 user_version 4：聚合表刚建好，旧库（Java 版或 Go 版）的历史明细待回溯；
-//   - 聚合表被误删或手工清空。
+// 需要从明细回溯的实质条件是「这组聚合表全空而明细表有数据」，按组分开判断：
+//   - 总量组（stats_daily / stats_ip_daily，user_version 4 引入）；
+//   - 排行组（stats_usernames / stats_passwords / stats_locations，user_version 5 引入）。
 //
-// 全新空库（明细也为空）不做任何事。回溯在单事务内完成，崩溃不会留下半成品；
-// user_version 由 init 在迁移成功后写入，中途失败时下次启动会重新尝试。
+// 分组判断让 user_version 4 的旧库升级时只回溯新增的排行表，不重复扫明细重建总量；
+// 聚合表被误删或手工清空也能自愈。全新空库（明细也为空）不做任何事。
+// 回溯在单事务内完成，崩溃不会留下半成品；user_version 由 init 在迁移成功后写入。
 func (s *Store) migrateStats() error {
-	need, err := s.statsMissing()
-	if err != nil || !need {
-		return err
+	groups := []struct {
+		label   string
+		tables  []string
+		rebuild func() error
+	}{
+		{"总量统计", []string{"stats_daily", "stats_ip_daily"}, s.rebuildStats},
+		{"排行统计", []string{"stats_usernames", "stats_passwords", "stats_locations"}, s.rebuildRankings},
 	}
-
-	infof(s.logger, "预聚合统计表需要从明细回溯重建（首次升级或聚合表被清空时发生），请稍候...")
-	start := time.Now()
-	if err := s.rebuildStats(); err != nil {
-		return err
+	for _, g := range groups {
+		need, err := s.statsMissing(g.tables)
+		if err != nil {
+			return err
+		}
+		if !need {
+			continue
+		}
+		infof(s.logger, "预聚合"+g.label+"表需要从明细回溯重建（首次升级或聚合表被清空时发生），请稍候...")
+		start := time.Now()
+		if err := g.rebuild(); err != nil {
+			return err
+		}
+		infof(s.logger, fmt.Sprintf("预聚合%s表已从明细回溯重建，耗时 %s", g.label, time.Since(start).Round(time.Millisecond)))
 	}
-	infof(s.logger, fmt.Sprintf("预聚合统计表已从明细回溯重建，耗时 %s", time.Since(start).Round(time.Millisecond)))
 	return nil
 }
 
-// statsMissing 聚合表为空但明细表有数据时返回 true（需要从明细回溯）。
-func (s *Store) statsMissing() (bool, error) {
-	empty, err := s.statsEmpty()
+// statsMissing 这组聚合表全空但明细表有数据时返回 true（需要从明细回溯）。
+func (s *Store) statsMissing(tables []string) (bool, error) {
+	empty, err := s.statsEmpty(tables)
 	if err != nil || !empty {
 		return false, err
 	}
 	return s.hasAnyEvent()
 }
 
-// statsEmpty 聚合表是否完全没有数据（EXISTS 短路，不扫全表）。
-func (s *Store) statsEmpty() (bool, error) {
-	for _, table := range []string{"stats_daily", "stats_ip_daily"} {
+// statsEmpty 给定的一组表是否完全没有数据（EXISTS 短路，不扫全表）。
+func (s *Store) statsEmpty(tables []string) (bool, error) {
+	for _, table := range tables {
 		var exists int
 		if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM ` + table + `)`).Scan(&exists); err != nil {
 			return false, fmt.Errorf("检查聚合表 %s 失败: %w", table, err)
@@ -683,7 +846,7 @@ func (s *Store) hasAnyEvent() (bool, error) {
 	return false, nil
 }
 
-// rebuildStats 清空并用明细表重建聚合表（单事务，崩溃不会留下半成品）。
+// rebuildStats 清空并用明细表重建总量聚合表（单事务，崩溃不会留下半成品）。
 // 版本号由 init 在迁移成功后写入，这里不涉及 user_version。
 func (s *Store) rebuildStats() error {
 	tx, err := s.db.Begin()
@@ -706,6 +869,35 @@ func (s *Store) rebuildStats() error {
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("提交统计重建事务失败: %w", err)
+	}
+	return nil
+}
+
+// rebuildRankings 清空并用 auth_attempts 重建用户名 / 口令 / 归属地排行
+// （单事务，崩溃不会留下半成品）。
+func (s *Store) rebuildRankings() error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("开启排行重建事务失败: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }() // 已提交时为 ErrTxDone，可忽略
+
+	for _, stmt := range []string{
+		`DELETE FROM stats_usernames`,
+		`DELETE FROM stats_passwords`,
+		`DELETE FROM stats_locations`,
+	} {
+		if _, err := tx.Exec(stmt); err != nil {
+			return fmt.Errorf("清空排行统计失败: %w", err)
+		}
+	}
+	for _, stmt := range []string{sqlBackfillUsernames, sqlBackfillPasswords, sqlBackfillLocations} {
+		if _, err := tx.Exec(stmt); err != nil {
+			return fmt.Errorf("重建排行统计失败: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交排行重建事务失败: %w", err)
 	}
 	return nil
 }

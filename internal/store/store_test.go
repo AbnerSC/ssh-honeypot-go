@@ -63,7 +63,7 @@ func TestIndexes(t *testing.T) {
 
 	want := []string{
 		"idx_sessions_src_ip", "idx_sessions_opened", "idx_sessions_protocol",
-		"idx_auth_src_ip", "idx_auth_username", "idx_auth_ts", "idx_auth_password", "idx_auth_location",
+		"idx_auth_src_ip", "idx_auth_username", "idx_auth_ts",
 		"idx_commands_session", "idx_commands_src_ip", "idx_commands_ts",
 		"idx_downloads_src_ip", "idx_downloads_ts",
 		"idx_ip_locks_src_ip", "idx_ip_locks_ts",
@@ -84,6 +84,12 @@ func TestIndexes(t *testing.T) {
 	for _, name := range want {
 		if !got[name] {
 			t.Errorf("缺少索引 %s", name)
+		}
+	}
+	// 退役索引（user_version 6）不得再建：口令 / 归属地排行已由聚合表承担
+	for _, name := range []string{"idx_auth_password", "idx_auth_location"} {
+		if got[name] {
+			t.Errorf("退役索引 %s 不应存在", name)
 		}
 	}
 }
@@ -387,6 +393,102 @@ func TestStatsBackfillFromDetail(t *testing.T) {
 	}
 }
 
+// TestRankingAggregation 登录尝试必须同步累加到用户名 / 口令 / 归属地排行表。
+func TestRankingAggregation(t *testing.T) {
+	s := openTemp(t)
+	const ts = "2026-10-25 12:00:00.123"
+	const epoch = int64(1761364800123)
+
+	for i := 0; i < 3; i++ {
+		if err := s.RecordAuthAttempt(ts, epoch, "s1", "ssh", "203.0.113.7", "root", "123456", false, "美国 加利福尼亚州"); err != nil {
+			t.Fatalf("RecordAuthAttempt: %v", err)
+		}
+	}
+	// 空归属地单独成键（Web 端归入「未知」），不能与其它地区混在一起
+	if err := s.RecordAuthAttempt(ts, epoch, "s1", "ssh", "198.51.100.9", "admin", "admin", false, ""); err != nil {
+		t.Fatalf("RecordAuthAttempt: %v", err)
+	}
+	// 非登录事件不写入排行
+	if err := s.RecordCommand(ts, epoch, "s1", "203.0.113.7", "root", "id", "美国 加利福尼亚州"); err != nil {
+		t.Fatalf("RecordCommand: %v", err)
+	}
+
+	cases := []struct {
+		query string
+		want  int64
+		name  string
+	}{
+		{`SELECT auth_attempts FROM stats_usernames WHERE username = 'root'`, 3, "用户名 root"},
+		{`SELECT auth_attempts FROM stats_usernames WHERE username = 'admin'`, 1, "用户名 admin"},
+		{`SELECT auth_attempts FROM stats_passwords WHERE password = '123456'`, 3, "口令 123456"},
+		{`SELECT auth_attempts FROM stats_locations WHERE location = '美国 加利福尼亚州'`, 3, "归属地"},
+		{`SELECT auth_attempts FROM stats_locations WHERE location = ''`, 1, "未知归属地"},
+	}
+	for _, c := range cases {
+		var got int64
+		if err := s.db.QueryRow(c.query).Scan(&got); err != nil {
+			t.Fatalf("查询%s排行失败: %v", c.name, err)
+		}
+		if got != c.want {
+			t.Errorf("%s = %d, want %d", c.name, got, c.want)
+		}
+	}
+}
+
+// TestRankingBackfillFromDetail user_version 4 的旧库（排行表为空、明细有数据）必须回溯重建。
+func TestRankingBackfillFromDetail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+
+	first, err := Open(path, nil)
+	if err != nil {
+		t.Fatalf("初始化失败: %v", err)
+	}
+	// 模拟旧库：明细由旧版直接写入，排行表为空，版本号退回 4
+	for _, stmt := range []string{
+		`DELETE FROM stats_usernames`,
+		`DELETE FROM stats_passwords`,
+		`DELETE FROM stats_locations`,
+		`PRAGMA user_version=4`,
+		`INSERT INTO auth_attempts(ts, ts_epoch_ms, src_ip, username, password, success, location)
+		 VALUES('2026-10-24 01:02:04.000',1761267724000,'198.51.100.9','root','x',0,'美国')`,
+		`INSERT INTO auth_attempts(ts, ts_epoch_ms, src_ip, username, password, success, location)
+		 VALUES('2026-10-24 01:02:05.000',1761267725000,'198.51.100.9','root','y',0,NULL)`,
+	} {
+		if _, err := first.db.Exec(stmt); err != nil {
+			t.Fatalf("构造旧数据失败（%s）: %v", stmt, err)
+		}
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("关闭旧库失败: %v", err)
+	}
+
+	second, err := Open(path, nil)
+	if err != nil {
+		t.Fatalf("重开失败: %v", err)
+	}
+	defer second.Close()
+
+	cases := []struct {
+		query string
+		want  int64
+		name  string
+	}{
+		{`SELECT auth_attempts FROM stats_usernames WHERE username = 'root'`, 2, "用户名 root"},
+		{`SELECT auth_attempts FROM stats_passwords WHERE password = 'x'`, 1, "口令 x"},
+		{`SELECT auth_attempts FROM stats_locations WHERE location = '美国'`, 1, "归属地 美国"},
+		{`SELECT auth_attempts FROM stats_locations WHERE location = ''`, 1, "未知归属地"},
+	}
+	for _, c := range cases {
+		var got int64
+		if err := second.db.QueryRow(c.query).Scan(&got); err != nil {
+			t.Fatalf("查询%s回溯结果失败: %v", c.name, err)
+		}
+		if got != c.want {
+			t.Errorf("%s = %d, want %d", c.name, got, c.want)
+		}
+	}
+}
+
 // TestTxBatchWrites 事务批量写入必须生效，且统计与明细在同一事务内可见。
 func TestTxBatchWrites(t *testing.T) {
 	s := openTemp(t)
@@ -414,6 +516,63 @@ func TestTxBatchWrites(t *testing.T) {
 	}
 	if detail != 3 || aggregated != 3 {
 		t.Errorf("批量写入不符: detail=%d aggregated=%d", detail, aggregated)
+	}
+}
+
+// TestRetiredIndexesDroppedFromLegacyDB 旧库（user_version=5）上的退役索引
+// 必须在启动迁移时被删除，且明细数据不受影响。
+func TestRetiredIndexesDroppedFromLegacyDB(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database.db")
+
+	first, err := Open(path, nil)
+	if err != nil {
+		t.Fatalf("首次打开失败: %v", err)
+	}
+	// 模拟 v5 库：退役索引仍在、版本号退回 5
+	for _, stmt := range []string{
+		`CREATE INDEX idx_auth_password ON auth_attempts(password)`,
+		`CREATE INDEX idx_auth_location ON auth_attempts(location)`,
+		`PRAGMA user_version=5`,
+		`INSERT INTO auth_attempts(ts, ts_epoch_ms, src_ip, username, password, success, location)
+		 VALUES('2026-10-25 12:00:00.000',1761364800000,'203.0.113.7','root','123456',0,'中国 北京')`,
+	} {
+		if _, err := first.db.Exec(stmt); err != nil {
+			t.Fatalf("构造旧库失败（%s）: %v", stmt, err)
+		}
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("关闭旧库失败: %v", err)
+	}
+
+	second, err := Open(path, nil)
+	if err != nil {
+		t.Fatalf("迁移打开失败: %v", err)
+	}
+	defer second.Close()
+
+	for _, name := range []string{"idx_auth_password", "idx_auth_location"} {
+		var n int
+		if err := second.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name = ?`, name).
+			Scan(&n); err != nil {
+			t.Fatalf("查询索引 %s 失败: %v", name, err)
+		}
+		if n != 0 {
+			t.Errorf("迁移后退役索引 %s 仍存在", name)
+		}
+	}
+
+	var version, rows int
+	if err := second.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		t.Fatalf("读取版本失败: %v", err)
+	}
+	if version != schemaVersion {
+		t.Errorf("迁移后 user_version = %d, want %d", version, schemaVersion)
+	}
+	if err := second.db.QueryRow(`SELECT COUNT(*) FROM auth_attempts`).Scan(&rows); err != nil {
+		t.Fatalf("统计明细失败: %v", err)
+	}
+	if rows != 1 {
+		t.Errorf("迁移后明细行数 = %d, want 1", rows)
 	}
 }
 

@@ -13,7 +13,7 @@ import (
 	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/config"
 )
 
-// checkDBTables 自检期望存在的表：5 张攻击日志表 + 2 张预聚合统计表 + 2 张控制台系统表。
+// checkDBTables 自检期望存在的表：5 张攻击日志表 + 5 张预聚合统计表 + 2 张控制台系统表。
 var checkDBTables = []string{
 	"sessions",
 	"auth_attempts",
@@ -22,14 +22,17 @@ var checkDBTables = []string{
 	"ip_locks",
 	"stats_daily",
 	"stats_ip_daily",
+	"stats_usernames",
+	"stats_passwords",
+	"stats_locations",
 	"sys_users",
 	"sys_audit_log",
 }
 
-// checkDBSchemaVersion 期望的 PRAGMA user_version（Go 版当前为 4）。
-const checkDBSchemaVersion = 4
+// checkDBSchemaVersion 期望的 PRAGMA user_version（Go 版当前为 6）。
+const checkDBSchemaVersion = 6
 
-// runCheckDB 只读自检数据库：版本号 + 9 张表行数，确认库结构可直接由当前 Go 版接续。
+// runCheckDB 只读自检数据库：版本号 + 12 张表行数，确认库结构可直接由当前 Go 版接续。
 //
 // 全程只读：DSN 使用 mode=ro + query_only，绝不建表、补列或写入任何内容。
 func runCheckDB(cfg *config.Config, out io.Writer) int {

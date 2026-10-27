@@ -46,7 +46,7 @@ services:
       - ./db:/app/db               # SQLite 库、hostkey
     environment:
       - TZ=Asia/Shanghai
-      - AI_ENABLED=true
+      - AI_ENABLED=false
       - AI_BASE_URL=http://127.0.0.1:8000/v1
       - AI_API_KEY=abcdefg1234567890
       - AI_MODEL_NAME=qwen3.8-27b

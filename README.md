@@ -1,3 +1,7 @@
+<div style="text-align: center;">
+  <img src="logo.svg" alt="NetGazer Logo" width="200"/>
+</div>
+
 # NetGazer 网络凝视者（Go 版）
 
 ## GitHub

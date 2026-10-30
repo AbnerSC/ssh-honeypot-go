@@ -184,6 +184,20 @@ func TestTelnetAuthFailureLocksIP(t *testing.T) {
 	assertHasEvent(t, events, "ip_locked", map[string]string{"src_ip": "127.0.0.1"})
 }
 
+func TestTelnetLoginLineTooLong(t *testing.T) {
+	env := newTestEnv(t, 3)
+	c, closeFn := dial(t, env.addr)
+	defer closeFn()
+
+	c.expect("login: ")
+	// 无换行的超长输入不得在内存中无限累积，服务端应主动断开
+	c.send(strings.Repeat("A", maxLoginLine*4))
+	out := c.drain()
+	if strings.Contains(out, "Password: ") {
+		t.Fatalf("超长用户名不应进入口令阶段: %d 字节输出", len(out))
+	}
+}
+
 func readEvents(t *testing.T, path string) []map[string]string {
 	t.Helper()
 	data, err := os.ReadFile(path)

@@ -1,6 +1,7 @@
 package web
 
 import (
+	"fmt"
 	"net"
 	"net/http"
 	"strings"
@@ -11,22 +12,78 @@ var forwardedHeaders = []string{
 	"X-Forwarded-For", "X-Real-IP", "Proxy-Client-IP", "WL-Proxy-Client-IP",
 }
 
-// ClientIP 解析请求来源的真实客户端 IP（代理感知）。
+// ClientIPResolver 按「受信反向代理」白名单解析请求来源 IP。
 //
-// 仅当直连地址为私网/环回（判定存在本机前置代理）时才信任转发头，
-// 避免公网直连请求伪造 X-Forwarded-For 干扰审计与登录锁定；
-// 多级代理时取转发链首个公网 IP（链上全为内网时取首个内网 IP）。
-func ClientIP(r *http.Request) string {
-	direct := normalizeIP(stripPort(r.RemoteAddr))
-	if !isPrivateOrLoopback(direct) {
-		return direct // 公网直连，不信任任何转发头
+// 安全模型：转发头只能由受信代理写入，客户端可任意伪造，因此仅在直连地址
+// 命中 trustedProxies（CIDR）时才读取转发头；白名单为空（默认）时任何转发头
+// 都不被采信，ClientIP 恒等于 TCP 连接的对端地址。这样即使蜜罐部署在
+// Docker/内网环境中（直连地址看起来是私网网关），攻击者也无法通过伪造
+// X-Forwarded-For 绕过登录锁定或伪造审计来源。
+type ClientIPResolver struct {
+	trusted []*net.IPNet
+}
+
+// NewClientIPResolver 编译受信代理网段；非法条目直接报错（配置期失败优于运行期静默）。
+// 支持裸 IP（自动补全 /32 或 /128）与 CIDR 两种写法。
+func NewClientIPResolver(cidrs []string) (*ClientIPResolver, error) {
+	r := &ClientIPResolver{}
+	for _, raw := range cidrs {
+		s := strings.TrimSpace(raw)
+		if s == "" {
+			continue
+		}
+		if !strings.Contains(s, "/") {
+			ip := net.ParseIP(strings.Trim(s, "[]"))
+			if ip == nil {
+				return nil, fmt.Errorf("非法的受信代理地址: %q", raw)
+			}
+			bits := 32
+			if ip.To4() == nil {
+				bits = 128
+			}
+			s = fmt.Sprintf("%s/%d", ip.String(), bits)
+		}
+		_, ipnet, err := net.ParseCIDR(s)
+		if err != nil {
+			return nil, fmt.Errorf("非法的受信代理网段 %q: %w", raw, err)
+		}
+		r.trusted = append(r.trusted, ipnet)
+	}
+	return r, nil
+}
+
+// Resolve 解析来源 IP：直连地址不在受信代理网段时直接返回直连地址。
+func (r *ClientIPResolver) Resolve(req *http.Request) string {
+	direct := normalizeIP(stripPort(req.RemoteAddr))
+	if r == nil || !r.isTrusted(direct) {
+		return direct
 	}
 	for _, header := range forwardedHeaders {
-		if ip := firstMeaningful(r.Header.Get(header)); ip != "" {
+		if ip := firstMeaningful(req.Header.Get(header)); ip != "" {
 			return ip
 		}
 	}
-	return direct // 无转发头时退回直连地址
+	return direct
+}
+
+// isTrusted 判断直连地址是否命中受信代理网段。
+func (r *ClientIPResolver) isTrusted(ip string) bool {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return false
+	}
+	for _, n := range r.trusted {
+		if n.Contains(parsed) {
+			return true
+		}
+	}
+	return false
+}
+
+// ClientIP 兼容入口：不信任任何转发头，等价于未配置受信代理。
+// 生产路径请使用 Server 持有的 ClientIPResolver。
+func ClientIP(r *http.Request) string {
+	return normalizeIP(stripPort(r.RemoteAddr))
 }
 
 // normalizeIP 把 IPv4-mapped IPv6（如 ::ffff:172.20.0.1）还原为 IPv4，

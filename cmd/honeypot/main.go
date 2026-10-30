@@ -219,6 +219,7 @@ func serve(configPath string) int {
 				Addr:                  fmt.Sprintf(":%d", cfg.Web.Port),
 				DBPath:                cfg.Log.DB,
 				SessionTimeoutMinutes: cfg.Web.SessionTimeoutMinutes,
+				TrustedProxies:        cfg.Web.TrustedProxies,
 				Locator:               locator,
 				Logger:                logger,
 			})

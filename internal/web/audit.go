@@ -103,6 +103,21 @@ type auditRecord struct {
 	ok         bool
 }
 
+// 未认证请求的审计落库配额：登录接口无需认证即可无限调用，
+// 若逐条落库，少量请求即可让审计表与 WAL 线性膨胀（200 请求 ≈ 200KB）。
+// 同一来源 IP 每分钟只保留前 N 条未认证请求审计，其余丢弃并计数。
+const (
+	auditAnonWindow = time.Minute
+	auditAnonPerIP  = 30
+	auditAnonMaxIPs = 4096 // 配额表容量上限，防伪造海量 IP 撑爆内存
+)
+
+// auditFlood 单个来源 IP 的未认证审计配额。
+type auditFlood struct {
+	windowStart time.Time
+	count       int
+}
+
 // AuditRepo 系统操作审计日志仓库。
 //
 // 写入走独立单协程异步落库，不阻塞 Web 请求；查询走只读连接池，
@@ -119,6 +134,11 @@ type AuditRepo struct {
 	closed    bool
 	closeOnce sync.Once
 	dropped   atomic.Uint64
+
+	// anonMu / anonFlood 保护未认证请求的落库配额（见 auditAnonPerIP）。
+	anonMu    sync.Mutex
+	anonFlood map[string]*auditFlood
+	throttled atomic.Uint64
 }
 
 // newAuditRepo 建表 + 补齐存量列，并启动异步写入协程。
@@ -190,8 +210,17 @@ func auditHasColumn(db *sql.DB, column string) (bool, error) {
 }
 
 // Record 异步记录一条审计日志（脱敏 + 截断由调用方完成）。
+// authenticated 为 false（未登录请求）时受每 IP 分钟配额限制，
+// 超出配额的记录直接丢弃（只影响审计完整度，不影响业务与安全判定）。
 func (a *AuditRepo) Record(username, srcIP, method, path, query, reqBody string,
-	status int, respBody string, durationMs int64, ok bool) {
+	status int, respBody string, durationMs int64, ok bool, authenticated bool) {
+	if !authenticated && !a.allowAnonymous(srcIP) {
+		n := a.throttled.Add(1)
+		if n == 1 || n%1000 == 0 {
+			warnf(a.logger, fmt.Sprintf("未认证请求审计超出配额，已丢弃 %d 条记录", n))
+		}
+		return
+	}
 	now := time.Now()
 	rec := auditRecord{
 		ts:         now.Format(tsLayout),
@@ -221,6 +250,47 @@ func (a *AuditRepo) Record(username, srcIP, method, path, query, reqBody string,
 		n := a.dropped.Add(1)
 		if n == 1 || n%1000 == 0 {
 			warnf(a.logger, fmt.Sprintf("审计日志队列已满，已丢弃 %d 条记录", n))
+		}
+	}
+}
+
+// allowAnonymous 未认证请求的落库配额：同一来源 IP 每分钟最多 auditAnonPerIP 条。
+func (a *AuditRepo) allowAnonymous(srcIP string) bool {
+	a.anonMu.Lock()
+	defer a.anonMu.Unlock()
+
+	if a.anonFlood == nil {
+		a.anonFlood = make(map[string]*auditFlood, 64)
+	}
+	now := time.Now()
+	rec, ok := a.anonFlood[srcIP]
+	if !ok {
+		if len(a.anonFlood) >= auditAnonMaxIPs {
+			a.pruneAnonLocked(now)
+			if len(a.anonFlood) >= auditAnonMaxIPs {
+				return false
+			}
+		}
+		a.anonFlood[srcIP] = &auditFlood{windowStart: now, count: 1}
+		return true
+	}
+	if now.Sub(rec.windowStart) >= auditAnonWindow {
+		rec.windowStart = now
+		rec.count = 1
+		return true
+	}
+	if rec.count >= auditAnonPerIP {
+		return false
+	}
+	rec.count++
+	return true
+}
+
+// pruneAnonLocked 清理已过期窗口；调用方需持有 anonMu。
+func (a *AuditRepo) pruneAnonLocked(now time.Time) {
+	for ip, rec := range a.anonFlood {
+		if now.Sub(rec.windowStart) >= auditAnonWindow {
+			delete(a.anonFlood, ip)
 		}
 	}
 }
@@ -360,8 +430,9 @@ func (a *AuditRepo) List(q auditListQuery) (map[string]any, error) {
 	}
 	if v := strings.TrimSpace(q.pathKeyword); v != "" {
 		// 路径关键字同时匹配原始路径与中文描述，支持按中文（如「登录」）检索
-		w.raw("(path LIKE ? OR path_desc LIKE ?)")
-		w.args = append(w.args, "%"+v+"%", "%"+v+"%")
+		w.raw("(path LIKE ? ESCAPE '\\' OR path_desc LIKE ? ESCAPE '\\')")
+		pattern := "%" + escapeLike(v) + "%"
+		w.args = append(w.args, pattern, pattern)
 	}
 	w.rangeMs("epoch_ms", q.start, q.end)
 
@@ -371,8 +442,12 @@ func (a *AuditRepo) List(q auditListQuery) (map[string]any, error) {
 	}
 
 	args := make([]any, 0, len(w.args)+2)
+	offset := int64(q.page-1) * int64(q.size)
+	if offset < 0 || q.page > maxPage {
+		offset = 0
+	}
 	args = append(args, w.args...)
-	args = append(args, q.size, int64(q.page-1)*int64(q.size))
+	args = append(args, q.size, offset)
 	rows, err := a.readDB.Query("SELECT * FROM sys_audit_log"+w.clause()+
 		" ORDER BY epoch_ms DESC, id DESC LIMIT ? OFFSET ?", args...)
 	if err != nil {

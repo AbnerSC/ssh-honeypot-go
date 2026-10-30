@@ -47,6 +47,10 @@ type loginResult struct {
 	Err  string
 }
 
+// dummyPasswordHash 用户不存在时的对齐哈希：保持与真实校验相同的 PBKDF2 开销，
+// 阻断通过响应耗时差异（约 40-50ms）枚举有效用户名的侧信道。
+var dummyPasswordHash = hashPassword("__timing_equalizer_dummy__")
+
 // login 校验用户名/口令。成功返回用户信息（不含哈希）并记录登录时间；
 // 失败返回错误描述（IP 锁定 / 用户名或密码错误）。
 func (a *Auth) login(ip, username, password string) (*loginResult, error) {
@@ -58,7 +62,16 @@ func (a *Auth) login(ip, username, password string) (*loginResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	if user == nil || !user.Enabled || !verifyPassword(password, user.PasswordHash) {
+	// 用户不存在时仍执行一次等价开销的 PBKDF2，保证失败路径耗时一致
+	if user == nil {
+		verifyPassword(password, dummyPasswordHash)
+		a.recordFailure(ip)
+		if a.logger != nil {
+			a.logger.Warn(fmt.Sprintf("Web 控制台登录失败: ip=%s user=%s", ip, username))
+		}
+		return &loginResult{Err: "用户名或密码错误"}, nil
+	}
+	if !user.Enabled || !verifyPassword(password, user.PasswordHash) {
 		a.recordFailure(ip)
 		if a.logger != nil {
 			a.logger.Warn(fmt.Sprintf("Web 控制台登录失败: ip=%s user=%s", ip, username))

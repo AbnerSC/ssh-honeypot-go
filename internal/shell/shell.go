@@ -32,6 +32,13 @@ const (
 	telnetSE  byte = 0xF0
 )
 
+// 单行输入与历史表容量上限：防止攻击者以超长行或海量命令
+// 使会话内存无限增长（每会话独立，50 会话可成比例放大）。
+const (
+	maxCommandLine = 8192
+	maxHistory     = 500
+)
+
 // Output 单条命令的执行结果。
 //
 // 用结构体取代 Java 版的 `\x00NONL` / `\x00__EXIT__` 字符串标记（plan 5.2 允许的软契约）。
@@ -183,6 +190,9 @@ func (s *Shell) readLine() (string, bool) {
 		if b < 0x20 { // 忽略其它控制字符
 			continue
 		}
+		if len(buf) >= maxCommandLine { // 行缓冲已满：丢弃后续字符（真实终端同样会截断）
+			continue
+		}
 		buf = append(buf, b)
 		if err := s.writeRawByte(b); err != nil {
 			return "", false
@@ -320,6 +330,11 @@ func (s *Shell) writeRawByte(b byte) error {
 func (s *Shell) pushHistory(line string) {
 	if strings.TrimSpace(line) == "" {
 		return
+	}
+	// 历史表固定容量：长时间会话不应因命令数量无限增长内存
+	if len(s.nav) >= maxHistory {
+		copy(s.nav, s.nav[len(s.nav)-maxHistory+1:])
+		s.nav = s.nav[:maxHistory-1]
 	}
 	s.nav = append(s.nav, line)
 	s.navIdx = -1

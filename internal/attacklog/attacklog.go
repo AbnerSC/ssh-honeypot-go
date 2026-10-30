@@ -19,6 +19,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/geo"
 	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/store"
@@ -422,21 +423,71 @@ func buildLine(ts string, fields []field) string {
 	return b.String()
 }
 
-// jsonEscaper 预编译替换链：escape 处于每条事件的热路径。
-var jsonEscaper = strings.NewReplacer(
-	`\`, `\\`,
-	`"`, `\"`,
-	"\n", `\n`,
-	"\r", `\r`,
-	"\t", `\t`,
-)
+// hexDigits JSON \u00XX 转义用的十六进制字符表。
+const hexDigits = "0123456789abcdef"
 
-// escape 转义 JSON 特殊字符；不含特殊字符时直接复用原串，避免无谓拷贝。
+// needsEscape 判断是否需要转义：反向代理/攻击者可在用户名、口令、命令中
+// 注入任意字节，含控制字符或非法 UTF-8 时 JSONL 行不再合法，必须逐字节处理。
+func needsEscape(s string) bool {
+	if !utf8.ValidString(s) {
+		return true
+	}
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c < 0x20 || c == 0x7f || c == '\\' || c == '"' {
+			return true
+		}
+	}
+	return false
+}
+
+// escape 转义 JSON 特殊字符、全部控制字符（<0x20、0x7F）与非法 UTF-8 字节；
+// 不含特殊字符时直接复用原串，避免无谓拷贝。
 func escape(s string) string {
-	if !strings.ContainsAny(s, "\\\"\n\r\t") {
+	if !needsEscape(s) {
 		return s
 	}
-	return jsonEscaper.Replace(s)
+	var b strings.Builder
+	b.Grow(len(s) + 16)
+	for i := 0; i < len(s); {
+		c := s[i]
+		if c >= utf8.RuneSelf {
+			r, size := utf8.DecodeRuneInString(s[i:])
+			if r == utf8.RuneError && size == 1 {
+				b.WriteString(`\ufffd`) // 非法 UTF-8 字节：替换为 Unicode 替换符，保证行合法
+				i++
+				continue
+			}
+			b.WriteString(s[i : i+size])
+			i += size
+			continue
+		}
+		i++
+		switch c {
+		case '\\':
+			b.WriteString(`\\`)
+		case '"':
+			b.WriteString(`\"`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		case '\b':
+			b.WriteString(`\b`)
+		case '\f':
+			b.WriteString(`\f`)
+		default:
+			if c < 0x20 || c == 0x7f {
+				b.WriteString(`\u00`)
+				b.WriteByte(hexDigits[c>>4])
+				b.WriteByte(hexDigits[c&0x0f])
+			} else {
+				b.WriteByte(c)
+			}
+		}
+	}
+	return b.String()
 }
 
 func infof(logger *slog.Logger, msg string) {

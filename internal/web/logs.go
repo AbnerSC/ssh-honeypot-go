@@ -493,9 +493,29 @@ func (w *where) eq(column, value string) {
 
 func (w *where) like(column, value string) {
 	if v := strings.TrimSpace(value); v != "" {
-		w.raw(column + " LIKE ?")
-		w.args = append(w.args, "%"+v+"%")
+		// 通配符转义：用户输入的 % 与 _ 按字面量匹配，避免被当作模式通配
+		w.raw(column + ` LIKE ? ESCAPE '\'`)
+		w.args = append(w.args, "%"+escapeLike(v)+"%")
 	}
+}
+
+// escapeLike 转义 LIKE 模式中的通配符（配合 ESCAPE '\'）。
+func escapeLike(s string) string {
+	if !strings.ContainsAny(s, `%_\`) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s) + 4)
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; c {
+		case '%', '_', '\\':
+			b.WriteByte('\\')
+			b.WriteByte(c)
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
 }
 
 func (w *where) rangeMs(column string, start, end *int64) {
@@ -516,6 +536,9 @@ func (w *where) clause() string {
 	return " WHERE " + strings.Join(w.cond, " AND ")
 }
 
+// maxPage 分页页码上限：限制 OFFSET 规模，避免超大页码退化为全表扫描/整数溢出。
+const maxPage = 1_000_000
+
 // pageQuery 通用分页查询：返回 {total,page,size,rows}。
 func (l *LogRepo) pageQuery(table, columns string, w *where, page, size int,
 	order string) (map[string]any, error) {
@@ -525,8 +548,14 @@ func (l *LogRepo) pageQuery(table, columns string, w *where, page, size int,
 	}
 
 	args := make([]any, 0, len(w.args)+2)
+	// 偏移量用 int64 计算并限幅：page/size 来自查询参数，溢出后可能变成负数
+	offset := int64(page-1) * int64(size)
+	if offset < 0 || int64(page) > maxPage {
+		offset = 0
+		page = 1
+	}
 	args = append(args, w.args...)
-	args = append(args, size, int64(page-1)*int64(size))
+	args = append(args, size, offset)
 	sqlText := "SELECT " + columns + " FROM " + table + w.clause() + " " + order + " LIMIT ? OFFSET ?"
 
 	rows, err := l.db.Query(sqlText, args...)

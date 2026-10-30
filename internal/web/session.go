@@ -88,6 +88,24 @@ func (s *SessionStore) Destroy(id string) {
 	s.mu.Unlock()
 }
 
+// DestroyByUser 销毁指定用户的全部会话，返回销毁数量。
+//
+// 会话是登录瞬间的角色快照，账号被禁用/删除/重置密码后必须同步吊销，
+// 否则旧 Cookie 在过期前仍可继续读取控制台数据（权限撤销不生效）。
+// exceptID 非空时保留该会话（改密后保留当前端，踢掉其它端）。
+func (s *SessionStore) DestroyByUser(uid int64, exceptID string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for id, sess := range s.sessions {
+		if sess.UID == uid && id != exceptID {
+			delete(s.sessions, id)
+			n++
+		}
+	}
+	return n
+}
+
 // Close 停止清理协程。
 func (s *SessionStore) Close() {
 	s.stopOnce.Do(func() { close(s.done) })

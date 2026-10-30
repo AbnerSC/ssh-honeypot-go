@@ -52,8 +52,11 @@ func TestDefaultMatchesJava(t *testing.T) {
 	if cfg.Log.DB != filepath.Join("logs", "database.db") {
 		t.Errorf("log.db 默认值不符: %s", cfg.Log.DB)
 	}
-	if cfg.Web != (Web{Enabled: true, Port: 8080, SessionTimeoutMinutes: 30}) {
+	if cfg.Web.Enabled != true || cfg.Web.Port != 8080 || cfg.Web.SessionTimeoutMinutes != 30 {
 		t.Errorf("web 默认值不符: %+v", cfg.Web)
+	}
+	if len(cfg.Web.TrustedProxies) != 0 {
+		t.Errorf("默认不应信任任何转发代理: %v", cfg.Web.TrustedProxies)
 	}
 	if cfg.Auth.MaxFailures != 3 || cfg.Auth.WindowMinutes != 5 || cfg.Auth.LockMinutes != 30 {
 		t.Errorf("auth 默认值不符: %+v", cfg.Auth)

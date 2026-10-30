@@ -130,7 +130,7 @@ func queryBool(r *http.Request, name string) *bool {
 }
 
 func pageParam(r *http.Request) int {
-	return max(1, queryInt(r, "page", 1))
+	return min(maxPage, max(1, queryInt(r, "page", 1)))
 }
 
 func sizeParam(r *http.Request) int {
@@ -158,6 +158,16 @@ func pathID(r *http.Request) (int64, bool) {
 
 // handleLogin POST /api/login
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	// 并发闸门：PBKDF2 单次约 50-150ms CPU，未认证接口必须限并发，
+	// 否则少量并发请求即可拉满 CPU 并拖慢蜜罐主链路。
+	select {
+	case s.loginSem <- struct{}{}:
+		defer func() { <-s.loginSem }()
+	default:
+		writeError(w, http.StatusTooManyRequests, "登录请求过于频繁，请稍后重试")
+		return
+	}
+
 	body, err := parseBody(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "请求体不是合法 JSON")
@@ -170,7 +180,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := s.auth.login(ClientIP(r), username, password)
+	result, err := s.auth.login(s.clientIP.Resolve(r), username, password)
 	if err != nil {
 		s.internalError(w, r, err)
 		return
@@ -185,7 +195,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		s.sessions.Destroy(old.ID)
 	}
 	sess := s.sessions.Create(result.User.ID, result.User.Username, result.User.Role)
-	setSessionCookie(w, sess.ID)
+	setSessionCookie(w, r, sess.ID)
 	if state := auditStateFrom(r); state != nil {
 		state.username = result.User.Username
 	}
@@ -197,7 +207,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if sess := s.sessionFrom(r); sess != nil {
 		s.sessions.Destroy(sess.ID)
 	}
-	clearSessionCookie(w)
+	clearSessionCookie(w, r)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -216,7 +226,7 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	if user == nil || !user.Enabled {
 		// 账号已删除/禁用，清除残留会话
 		s.sessions.Destroy(sess.ID)
-		clearSessionCookie(w)
+		clearSessionCookie(w, r)
 		writeError(w, http.StatusUnauthorized, "账号不可用")
 		return
 	}
@@ -255,6 +265,8 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		s.internalError(w, r, err)
 		return
 	}
+	// 改密后吐回该用户其它终端的会话（保留当前会话），避免旧 Cookie 继续有效
+	s.sessions.DestroyByUser(sess.UID, sess.ID)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -542,6 +554,11 @@ func (s *Server) handleUserStatus(w http.ResponseWriter, r *http.Request) {
 		s.internalError(w, r, err)
 		return
 	}
+	// 禁用后立即吐回该账号的全部会话：权限撤销必须及时生效，
+	// 否则旧 Cookie 在会话过期前仍可读取攻击日志等敏感数据
+	if !enabled {
+		s.sessions.DestroyByUser(targetID, "")
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -583,6 +600,8 @@ func (s *Server) handleUserPassword(w http.ResponseWriter, r *http.Request) {
 		s.internalError(w, r, err)
 		return
 	}
+	// 重置口令后吐回目标账号全部会话，防止密码已变更但旧会话仍然有效
+	s.sessions.DestroyByUser(targetID, "")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -626,6 +645,8 @@ func (s *Server) handleUserDelete(w http.ResponseWriter, r *http.Request) {
 		s.internalError(w, r, err)
 		return
 	}
+	// 删除后旧会话必须立即失效（会话内没有账号存在性校验）
+	s.sessions.DestroyByUser(targetID, "")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 

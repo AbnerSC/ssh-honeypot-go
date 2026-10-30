@@ -47,6 +47,13 @@ type Web struct {
 	Port    int  `yaml:"port"`
 	// SessionTimeoutMinutes 管理端登录会话滑动过期时间（分钟）。
 	SessionTimeoutMinutes int `yaml:"sessionTimeoutMinutes"`
+	// TrustedProxies 受信反向代理网段（CIDR 或裸 IP）列表。
+	//
+	// 仅在直连地址命中列表时才采信 X-Forwarded-For 等转发头；
+	// 为空（默认）表示不信任任何转发头，来源 IP 恒为 TCP 对端地址。
+	// 部署在 Nginx/HAProxy 之后时，必须显式填写代理地址，否则登录锁定
+	// 与审计会把所有请求记为代理 IP（安全但失真）。
+	TrustedProxies []string `yaml:"trustedProxies"`
 }
 
 // Service 将 Web 配置视为通用监听配置，便于与其余协议统一处理。

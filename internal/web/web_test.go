@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -21,6 +22,12 @@ import (
 
 func newTestServer(t *testing.T) (*Server, *httptest.Server) {
 	t.Helper()
+	return newTestServerWith(t, nil)
+}
+
+// newTestServerWith 允许单个用例定制 Options（如受信代理白名单）。
+func newTestServerWith(t *testing.T, mutate func(*Options)) (*Server, *httptest.Server) {
+	t.Helper()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	dbPath := filepath.Join(t.TempDir(), "database.db")
 
@@ -32,12 +39,16 @@ func newTestServer(t *testing.T) (*Server, *httptest.Server) {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 
-	srv, err := New(Options{
+	opts := Options{
 		Addr:                  "127.0.0.1:0",
 		DBPath:                dbPath,
 		SessionTimeoutMinutes: 30,
 		Logger:                logger,
-	})
+	}
+	if mutate != nil {
+		mutate(&opts)
+	}
+	srv, err := New(opts)
 	if err != nil {
 		t.Fatalf("创建 Web 服务失败: %v", err)
 	}
@@ -77,6 +88,13 @@ type apiResponse struct {
 // call 发起一次 API 调用并解析包络。
 func call(t *testing.T, client *http.Client, method, url string, payload any) (*http.Response, apiResponse) {
 	t.Helper()
+	return callWithHeader(t, client, method, url, payload, nil)
+}
+
+// callWithHeader 同 call，额外设置请求头（用于伪造 X-Forwarded-For 等场景）。
+func callWithHeader(t *testing.T, client *http.Client, method, url string, payload any,
+	headers map[string]string) (*http.Response, apiResponse) {
+	t.Helper()
 	var body io.Reader
 	if payload != nil {
 		data, err := json.Marshal(payload)
@@ -91,6 +109,9 @@ func call(t *testing.T, client *http.Client, method, url string, payload any) (*
 	}
 	if payload != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -287,8 +308,14 @@ func TestAuditAndUserAdminPermission(t *testing.T) {
 	_, ts := newTestServer(t)
 	admin := newClient(t)
 	loginAdmin(t, admin, ts.URL)
+	// 默认管理员首次登录强制改密（服务端拦截其它 API），先完成改密
+	resp, body := call(t, admin, http.MethodPut, ts.URL+"/api/password",
+		map[string]any{"oldPassword": "admin123", "newPassword": "admin456789"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("管理员改密失败: %d (%s)", resp.StatusCode, body.Error)
+	}
 
-	resp, body := call(t, admin, http.MethodPost, ts.URL+"/api/users",
+	resp, body = call(t, admin, http.MethodPost, ts.URL+"/api/users",
 		map[string]any{"username": "viewer1", "password": "viewer123", "role": RoleViewer, "mustChange": false})
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("新增 viewer 失败: %s", body.Error)
@@ -456,45 +483,64 @@ func TestEChartsEndpoint(t *testing.T) {
 
 // 纯函数单测
 
-func TestClientIP(t *testing.T) {
+// TestClientIPResolver 来源 IP 解析的安全模型：
+// 转发头只能由受信代理写入，未配置白名单时任何转发头都不得采信，
+// 否则攻击者可伪造 X-Forwarded-For 绕过登录锁定或伪造审计来源。
+func TestClientIPResolver(t *testing.T) {
+	untrusted, err := NewClientIPResolver(nil)
+	if err != nil {
+		t.Fatalf("构造默认解析器失败: %v", err)
+	}
+	trusted, err := NewClientIPResolver([]string{"10.0.0.0/8", "::1"})
+	if err != nil {
+		t.Fatalf("构造受信代理解析器失败: %v", err)
+	}
+
 	cases := []struct {
 		name       string
+		resolver   *ClientIPResolver
 		remoteAddr string
 		headers    map[string]string
 		want       string
 	}{
 		{
-			name:       "公网直连不信任转发头",
+			name:       "默认不信任转发头",
+			resolver:   untrusted,
+			remoteAddr: "172.18.0.1:52100",
+			headers:    map[string]string{"X-Forwarded-For": "8.8.8.8"},
+			want:       "172.18.0.1",
+		},
+		{
+			name:       "受信代理才读链路首个 IP",
+			resolver:   trusted,
+			remoteAddr: "10.1.2.3:52100",
+			headers:    map[string]string{"X-Forwarded-For": "8.8.8.8, 10.0.0.2"},
+			want:       "8.8.8.8",
+		},
+		{
+			name:       "非受信直连地址忽略转发头",
+			resolver:   trusted,
 			remoteAddr: "203.0.113.9:52100",
 			headers:    map[string]string{"X-Forwarded-For": "1.2.3.4"},
 			want:       "203.0.113.9",
 		},
 		{
-			name:       "内网代理取链路首个公网 IP",
-			remoteAddr: "172.18.0.1:52100",
-			headers:    map[string]string{"X-Forwarded-For": "10.0.0.1, 8.8.8.8, 10.0.0.2"},
-			want:       "8.8.8.8",
-		},
-		{
-			name:       "链路全内网时取首个内网 IP",
-			remoteAddr: "127.0.0.1:52100",
-			headers:    map[string]string{"X-Forwarded-For": "192.168.1.5, 10.0.0.2"},
-			want:       "192.168.1.5",
-		},
-		{
-			name:       "IPv4-mapped 直连地址归一后再判断",
-			remoteAddr: "[::ffff:172.18.0.1]:52100",
-			headers:    map[string]string{"X-Real-IP": "10.1.1.1"},
-			want:       "10.1.1.1",
-		},
-		{
 			name:       "转发头带端口时剥离",
+			resolver:   trusted,
 			remoteAddr: "10.0.0.1:52100",
 			headers:    map[string]string{"X-Forwarded-For": "203.0.113.7:4433"},
 			want:       "203.0.113.7",
 		},
 		{
+			name:       "IPv4-mapped 直连地址归一",
+			resolver:   untrusted,
+			remoteAddr: "[::ffff:172.18.0.1]:52100",
+			headers:    map[string]string{"X-Real-IP": "10.1.1.1"},
+			want:       "172.18.0.1",
+		},
+		{
 			name:       "无转发头退回直连地址",
+			resolver:   trusted,
 			remoteAddr: "10.0.0.1:52100",
 			want:       "10.0.0.1",
 		},
@@ -507,10 +553,259 @@ func TestClientIP(t *testing.T) {
 			for k, v := range tc.headers {
 				req.Header.Set(k, v)
 			}
-			if got := ClientIP(req); got != tc.want {
-				t.Fatalf("ClientIP = %q, 期望 %q", got, tc.want)
+			if got := tc.resolver.Resolve(req); got != tc.want {
+				t.Fatalf("Resolve = %q, 期望 %q", got, tc.want)
+			}
+			// 兼容入口 ClientIP 恒不信任转发头
+			if got := ClientIP(req); got != normalizeIP(stripPort(tc.remoteAddr)) {
+				t.Fatalf("ClientIP = %q, 期望直连地址", got)
 			}
 		})
+	}
+
+	// 非法受信代理配置必须在启动时报错，而不是静默失效
+	if _, err := NewClientIPResolver([]string{"not-an-ip", "10.0.0.0/33"}); err == nil {
+		t.Fatal("非法受信代理配置应报错")
+	}
+}
+
+// TestMustChangeForcedByServer 默认口令登录后必须强制改密：
+// mustChange 仅前端拦截时，攻击者直接调 API 即可获取控制台数据。
+func TestMustChangeForcedByServer(t *testing.T) {
+	_, ts := newTestServer(t)
+	client := newClient(t)
+	loginAdmin(t, client, ts.URL)
+
+	resp, body := call(t, client, http.MethodGet, ts.URL+"/api/users", nil)
+	if resp.StatusCode != http.StatusForbidden || !strings.Contains(body.Error, "修改密码") {
+		t.Fatalf("未改密时应拒绝控制台 API，实际 %d (%s)", resp.StatusCode, body.Error)
+	}
+	resp, _ = call(t, client, http.MethodGet, ts.URL+"/api/stats/overview", nil)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("未改密时不应可读攻击统计，实际 %d", resp.StatusCode)
+	}
+
+	// 自身信息、改密、静态资源仍放行
+	resp, _ = call(t, client, http.MethodGet, ts.URL+"/api/me", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("/api/me 应放行，实际 %d", resp.StatusCode)
+	}
+	resp, _ = call(t, client, http.MethodPut, ts.URL+"/api/password",
+		map[string]any{"oldPassword": "admin123", "newPassword": "admin456789"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("改密应放行，实际 %d", resp.StatusCode)
+	}
+
+	resp, body = call(t, client, http.MethodGet, ts.URL+"/api/users", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("改密后应可访问控制台 API，实际 %d (%s)", resp.StatusCode, body.Error)
+	}
+}
+
+// TestSessionRevokedOnAccountChange 账号被禁用/重置口令/删除后，
+// 旧会话必须立即失效（权限撤销不能等会话自然过期）。
+func TestSessionRevokedOnAccountChange(t *testing.T) {
+	_, ts := newTestServer(t)
+
+	admin := newClient(t)
+	loginAdmin(t, admin, ts.URL)
+	if resp, body := call(t, admin, http.MethodPut, ts.URL+"/api/password",
+		map[string]any{"oldPassword": "admin123", "newPassword": "admin456789"}); resp.StatusCode != http.StatusOK {
+		t.Fatalf("管理员改密失败: %d (%s)", resp.StatusCode, body.Error)
+	}
+
+	resp, body := call(t, admin, http.MethodPost, ts.URL+"/api/users", map[string]any{
+		"username": "viewer2", "password": "viewer123", "role": RoleViewer, "mustChange": false,
+	})
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("创建 viewer2 失败: %s", body.Error)
+	}
+	var created struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.Unmarshal(body.Data, &created); err != nil || created.ID == 0 {
+		t.Fatalf("解析用户 ID 失败: %v (%s)", err, body.Data)
+	}
+
+	loginViewer := func(client *http.Client) {
+		t.Helper()
+		resp, body := call(t, client, http.MethodPost, ts.URL+"/api/login",
+			map[string]any{"username": "viewer2", "password": "viewer123"})
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("viewer2 登录失败: %d (%s)", resp.StatusCode, body.Error)
+		}
+	}
+	assertRevoked := func(client *http.Client, stage string) {
+		t.Helper()
+		resp, _ := call(t, client, http.MethodGet, ts.URL+"/api/stats/overview", nil)
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("%s后旧会话应失效（401），实际 %d", stage, resp.StatusCode)
+		}
+	}
+
+	viewer := newClient(t)
+	loginViewer(viewer)
+	if resp, _ := call(t, viewer, http.MethodGet, ts.URL+"/api/stats/overview", nil); resp.StatusCode != http.StatusOK {
+		t.Fatalf("viewer2 会话应可用，实际 %d", resp.StatusCode)
+	}
+
+	// 禁用 → 旧会话 401
+	if resp, body := call(t, admin, http.MethodPut,
+		fmt.Sprintf("%s/api/users/%d/status", ts.URL, created.ID),
+		map[string]any{"enabled": false}); resp.StatusCode != http.StatusOK {
+		t.Fatalf("禁用用户失败: %d (%s)", resp.StatusCode, body.Error)
+	}
+	assertRevoked(viewer, "禁用")
+
+	// 重新启用后重新登录 → 重置口令 → 旧会话 401
+	if resp, body := call(t, admin, http.MethodPut,
+		fmt.Sprintf("%s/api/users/%d/status", ts.URL, created.ID),
+		map[string]any{"enabled": true}); resp.StatusCode != http.StatusOK {
+		t.Fatalf("启用用户失败: %d (%s)", resp.StatusCode, body.Error)
+	}
+	loginViewer(viewer)
+	if resp, body := call(t, admin, http.MethodPut,
+		fmt.Sprintf("%s/api/users/%d/password", ts.URL, created.ID),
+		map[string]any{"password": "viewer456", "mustChange": false}); resp.StatusCode != http.StatusOK {
+		t.Fatalf("重置密码失败: %d (%s)", resp.StatusCode, body.Error)
+	}
+	assertRevoked(viewer, "重置密码")
+
+	// 新口令登录 → 删除用户 → 旧会话 401
+	resp, body = call(t, viewer, http.MethodPost, ts.URL+"/api/login",
+		map[string]any{"username": "viewer2", "password": "viewer456"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("新口令登录失败: %d (%s)", resp.StatusCode, body.Error)
+	}
+	if resp, body := call(t, admin, http.MethodDelete,
+		fmt.Sprintf("%s/api/users/%d", ts.URL, created.ID), nil); resp.StatusCode != http.StatusOK {
+		t.Fatalf("删除用户失败: %d (%s)", resp.StatusCode, body.Error)
+	}
+	assertRevoked(viewer, "删除")
+}
+
+// TestChangePasswordRevokesOtherSessions 自助改密后其它终端会话必须失效，当前会话保留。
+func TestChangePasswordRevokesOtherSessions(t *testing.T) {
+	_, ts := newTestServer(t)
+	admin := newClient(t)
+	loginAdmin(t, admin, ts.URL)
+	if resp, body := call(t, admin, http.MethodPut, ts.URL+"/api/password",
+		map[string]any{"oldPassword": "admin123", "newPassword": "admin456789"}); resp.StatusCode != http.StatusOK {
+		t.Fatalf("管理员改密失败: %d (%s)", resp.StatusCode, body.Error)
+	}
+	if resp, body := call(t, admin, http.MethodPost, ts.URL+"/api/users", map[string]any{
+		"username": "viewer3", "password": "viewer123", "role": RoleViewer, "mustChange": false,
+	}); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("创建 viewer3 失败: %s", body.Error)
+	}
+
+	first, second := newClient(t), newClient(t)
+	for i, client := range []*http.Client{first, second} {
+		resp, body := call(t, client, http.MethodPost, ts.URL+"/api/login",
+			map[string]any{"username": "viewer3", "password": "viewer123"})
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("第 %d 个终端登录失败: %d (%s)", i+1, resp.StatusCode, body.Error)
+		}
+	}
+
+	if resp, body := call(t, first, http.MethodPut, ts.URL+"/api/password",
+		map[string]any{"oldPassword": "viewer123", "newPassword": "viewer456"}); resp.StatusCode != http.StatusOK {
+		t.Fatalf("改密失败: %d (%s)", resp.StatusCode, body.Error)
+	}
+	if resp, _ := call(t, first, http.MethodGet, ts.URL+"/api/stats/overview", nil); resp.StatusCode != http.StatusOK {
+		t.Fatalf("当前终端会话应保留，实际 %d", resp.StatusCode)
+	}
+	if resp, _ := call(t, second, http.MethodGet, ts.URL+"/api/stats/overview", nil); resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("其它终端旧会话应失效，实际 %d", resp.StatusCode)
+	}
+}
+
+// TestForwardedForIgnoredByDefault 伪造 X-Forwarded-For 不得绕过登录锁定。
+func TestForwardedForIgnoredByDefault(t *testing.T) {
+	srv, ts := newTestServer(t)
+	client := newClient(t)
+
+	for i := 0; i < loginMaxAttempts; i++ {
+		resp, _ := callWithHeader(t, client, http.MethodPost, ts.URL+"/api/login",
+			map[string]any{"username": "admin", "password": "wrong-password"},
+			map[string]string{"X-Forwarded-For": fmt.Sprintf("198.51.100.%d", i+1)})
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("第 %d 次失败登录状态码异常: %d", i+1, resp.StatusCode)
+		}
+	}
+
+	// 换一个伪造来源 IP 并给出正确口令：仍应命中锁定
+	resp, body := callWithHeader(t, client, http.MethodPost, ts.URL+"/api/login",
+		map[string]any{"username": "admin", "password": "admin123"},
+		map[string]string{"X-Forwarded-For": "203.0.113.200"})
+	if resp.StatusCode != http.StatusUnauthorized || !strings.Contains(body.Error, "已锁定") {
+		t.Fatalf("伪造转发头绕过了登录锁定，实际 %d (%s)", resp.StatusCode, body.Error)
+	}
+
+	// 审计记录的来源必须是真实直连地址（127.0.0.1），而不是伪造值
+	waitAuditCount(t, srv, "path = '/api/login'", loginMaxAttempts)
+	var srcIP string
+	if err := srv.readDB.QueryRow(`SELECT src_ip FROM sys_audit_log WHERE path = '/api/login' ORDER BY id DESC LIMIT 1`).Scan(&srcIP); err != nil {
+		t.Fatalf("读取审计来源失败: %v", err)
+	}
+	if srcIP != "127.0.0.1" {
+		t.Fatalf("审计来源被转发头伪造: %q", srcIP)
+	}
+}
+
+// TestTrustedProxyResolvesForwardedFor 配置受信代理后，转发头才用于来源解析与审计。
+func TestTrustedProxyResolvesForwardedFor(t *testing.T) {
+	srv, ts := newTestServerWith(t, func(o *Options) {
+		o.TrustedProxies = []string{"127.0.0.1"}
+	})
+	client := newClient(t)
+
+	resp, body := callWithHeader(t, client, http.MethodPost, ts.URL+"/api/login",
+		map[string]any{"username": "admin", "password": "admin123"},
+		map[string]string{"X-Forwarded-For": "45.33.32.156"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("受信代理下登录失败: %d (%s)", resp.StatusCode, body.Error)
+	}
+
+	waitAuditCount(t, srv, "path = '/api/login'", 1)
+	var srcIP string
+	if err := srv.readDB.QueryRow(`SELECT src_ip FROM sys_audit_log WHERE path = '/api/login' ORDER BY id DESC LIMIT 1`).Scan(&srcIP); err != nil {
+		t.Fatalf("读取审计来源失败: %v", err)
+	}
+	if srcIP != "45.33.32.156" {
+		t.Fatalf("受信代理下应记录真实客户端 IP，实际 %q", srcIP)
+	}
+}
+
+// TestEscapeLike 过滤值中的 % / _ 必须按字面量处理，不得被当作模式通配符。
+func TestEscapeLike(t *testing.T) {
+	cases := map[string]string{
+		"abc":  "abc",
+		"100%": `100\%`,
+		"a_b":  `a\_b`,
+		`a\b`:  `a\\b`,
+		"%_\\": `\%\_\\`,
+	}
+	for in, want := range cases {
+		if got := escapeLike(in); got != want {
+			t.Errorf("escapeLike(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestAuditAnonymousQuota 未认证请求审计按 IP 限额，避免登录接口被刷爆磁盘。
+func TestAuditAnonymousQuota(t *testing.T) {
+	repo := &AuditRepo{}
+	for i := 0; i < auditAnonPerIP; i++ {
+		if !repo.allowAnonymous("198.51.100.7") {
+			t.Fatalf("第 %d 条未认证审计不应被限流", i+1)
+		}
+	}
+	if repo.allowAnonymous("198.51.100.7") {
+		t.Fatalf("超出 %d 条/分钟应丢弃", auditAnonPerIP)
+	}
+	if !repo.allowAnonymous("203.0.113.8") {
+		t.Fatal("其它来源 IP 不应受影响")
 	}
 }
 

@@ -281,6 +281,11 @@ type lineReader struct {
 	pendingLF bool
 }
 
+// maxLoginLine 登录阶段单行最大字节数。
+// 不设上限时，攻击者可发送超长行（无换行）使缓冲区无限增长，
+// 且逐字节回显会把内存放大为 CPU/带宽放大（5MB 输入实测 RSS +5.4MB）。
+const maxLoginLine = 4096
+
 func newLineReader(in *bufio.Reader) *lineReader {
 	return &lineReader{in: in}
 }
@@ -344,6 +349,10 @@ func (l *lineReader) readLine(out io.Writer, prompt string, echo bool) (string, 
 			continue
 		}
 		buf = append(buf, b)
+		if len(buf) > maxLoginLine { // 超长行直接断开：内存与回显开销必须封顶
+			_, _ = out.Write(crlf)
+			return "", false
+		}
 		if echo {
 			_, _ = out.Write([]byte{b})
 		} else {

@@ -2,6 +2,8 @@ package shell
 
 import (
 	"bytes"
+	"io"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -88,6 +90,35 @@ func TestShellHistoryNavigation(t *testing.T) {
 	out, _ := runShell(t, "one\r\x1b[A\rexit\r")
 	if got := strings.Count(out, "OUT:one\r\n"); got != 2 {
 		t.Fatalf("历史导航应重复执行上一条命令，实际 %d 次: %q", got, out)
+	}
+}
+
+// TestShellCommandLineLimit 超长输入必须截断到 maxCommandLine，
+// 否则单会话内存与回显均可被无限放大（50 会话可成倍放大）。
+func TestShellCommandLineLimit(t *testing.T) {
+	long := strings.Repeat("A", maxCommandLine*2)
+	out, _ := runShell(t, long+"\rexit\r")
+	want := "OUT:" + strings.Repeat("A", maxCommandLine) + "\r\n"
+	if !strings.Contains(out, want) {
+		t.Fatalf("超长命令应截断到 %d 字节（实际输出 %d 字节）", maxCommandLine, len(out))
+	}
+}
+
+// TestShellHistoryCapacity 历史表固定容量：常量数量的命令后不得无限增长。
+func TestShellHistoryCapacity(t *testing.T) {
+	st := NewSession("s1", "203.0.113.9", "root", vfs.New("svr01"), "svr01")
+	sh := NewShell(strings.NewReader(""), io.Discard, st, stubProcessor{}, nil, nil)
+	for i := 0; i < maxHistory+10; i++ {
+		sh.pushHistory("cmd" + strconv.Itoa(i))
+	}
+	if len(sh.nav) != maxHistory {
+		t.Fatalf("历史表长度 = %d, want %d", len(sh.nav), maxHistory)
+	}
+	if got := sh.nav[len(sh.nav)-1]; got != "cmd"+strconv.Itoa(maxHistory+9) {
+		t.Fatalf("最新命令未保留: %q", got)
+	}
+	if got := sh.nav[0]; got != "cmd"+strconv.Itoa(10) {
+		t.Fatalf("最旧命令应被挤出: %q", got)
 	}
 }
 

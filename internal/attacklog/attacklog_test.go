@@ -2,6 +2,7 @@ package attacklog
 
 import (
 	"database/sql"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -28,19 +29,48 @@ func TestBuildLine(t *testing.T) {
 
 func TestEscape(t *testing.T) {
 	cases := map[string]string{
-		"plain": "plain",
-		`a"b`:   `a\"b`,
-		`a\b`:   `a\\b`,
-		"a\nb":  `a\nb`,
-		"a\rb":  `a\rb`,
-		"a\tb":  `a\tb`,
-		"中文":    "中文",
-		"":      "",
+		"plain":  "plain",
+		`a"b`:    `a\"b`,
+		`a\b`:    `a\\b`,
+		"a\nb":   `a\nb`,
+		"a\rb":   `a\rb`,
+		"a\tb":   `a\tb`,
+		"a\bb":   `a\bb`,
+		"a\fb":   `a\fb`,
+		"a\x02b": `a\u0002b`,
+		"\x00":   `\u0000`,
+		"\x1f":   `\u001f`,
+		"\x7f":   `\u007f`,
+		"中文":     "中文",
+		"":       "",
 	}
 	for in, want := range cases {
 		if got := escape(in); got != want {
 			t.Errorf("escape(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// TestBuildLineControlBytes 控制字符不得破坏 JSONL 行结构：
+// 攻击者可在用户名/口令/命令中注入任意字节，每行必须仍可被 JSON 解析。
+func TestBuildLineControlBytes(t *testing.T) {
+	line := buildLine("2026-10-25 12:00:00.123", []field{
+		{"username", "ro\x02ot\x1b[31m"},
+		{"password", "p\x00a\x1fss"},
+		{"command", "id\x7f;rm -rf /"},
+	})
+	var decoded map[string]string
+	if err := json.Unmarshal([]byte(line), &decoded); err != nil {
+		t.Fatalf("含控制字符的事件行不是合法 JSON: %v\n%s", err, line)
+	}
+	if decoded["username"] != "ro\x02ot\x1b[31m" || decoded["password"] != "p\x00a\x1fss" {
+		t.Fatalf("转义后回读内容不一致: %v", decoded)
+	}
+
+	// 非法 UTF-8 字节替换为 U+FFFD，保证行仍合法
+	bad := buildLine("2026-10-25 12:00:00.123", []field{{"username", string([]byte{0xff, 'a'})}})
+	if err := json.Unmarshal([]byte(bad), new(map[string]string)); err != nil {
+		t.Fatalf("含非法 UTF-8 的事件行不是合法 JSON: %v\n%s", err, bad)
 	}
 }
 

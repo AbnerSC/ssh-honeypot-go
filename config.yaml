@@ -55,6 +55,11 @@ web:
   enabled: true            # 是否启用 Web 控制台
   port: 8080               # Web 监听端口
   sessionTimeoutMinutes: 30  # 管理端登录会话超时（分钟）
+  # 受信反向代理网段（CIDR 或裸 IP）：仅当直连地址命中白名单时才采信
+  # X-Forwarded-For / X-Real-IP 等转发头；留空（默认）表示不信任任何转发头，
+  # 防止攻击者伪造来源 IP 绕过登录锁定或伪造审计来源。
+  # 示例（Nginx 与本服务同机）：trustedProxies: ["127.0.0.1", "10.0.0.0/8"]
+  trustedProxies: []
 
 # 登录认证（密码本）配置：仅密码本内的 用户名/密码 允许登录
 # 每个账号可配置多个密码（列表形式），命中任意一个即视为登录成功；

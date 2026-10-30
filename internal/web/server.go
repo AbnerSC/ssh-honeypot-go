@@ -43,11 +43,17 @@ type Options struct {
 	DBPath string
 	// SessionTimeoutMinutes 管理端登录会话滑动过期时间（分钟）。
 	SessionTimeoutMinutes int
+	// TrustedProxies 受信反向代理网段；为空时不采信任何转发头。
+	TrustedProxies []string
 	// Locator IP 归属地定位器（审计日志记录来源归属地），可为 nil。
 	Locator *geo.Locator
 	// Logger 运行日志。
 	Logger *slog.Logger
 }
+
+// loginConcurrency 登录接口并发上限：PBKDF2 迭代 210000 次，单请求约 50-150ms CPU；
+// 无上限时少量并发请求即可拉满 CPU（未认证即可发起）。超出立即返回 429，不排队。
+const loginConcurrency = 8
 
 // Server Web 控制台服务器。
 type Server struct {
@@ -62,6 +68,8 @@ type Server struct {
 	audit    *AuditRepo
 	auth     *Auth
 	sessions *SessionStore
+	clientIP *ClientIPResolver
+	loginSem chan struct{}
 
 	httpServer *http.Server
 	ln         net.Listener
@@ -74,6 +82,12 @@ func New(opts Options) (*Server, error) {
 		return nil, errors.New("Web 控制台缺少数据库路径")
 	}
 	logger := opts.Logger
+
+	// 受信代理列表在启动时编译：配错直接失败，避免运行期静默信任伪造源 IP
+	resolver, err := NewClientIPResolver(opts.TrustedProxies)
+	if err != nil {
+		return nil, err
+	}
 
 	// 先开写连接：由它把数据库切到 WAL（数据库级持久设置），只读连接随后自然继承
 	writeDB, err := openWriteDB(opts.DBPath)
@@ -112,6 +126,8 @@ func New(opts Options) (*Server, error) {
 		users:    users,
 		audit:    audit,
 		sessions: newSessionStore(time.Duration(opts.SessionTimeoutMinutes) * time.Minute),
+		clientIP: resolver,
+		loginSem: make(chan struct{}, loginConcurrency),
 	}
 	s.auth = newAuth(users, logger)
 	s.httpServer = &http.Server{
@@ -245,6 +261,9 @@ func auditStateFrom(r *http.Request) *auditState {
 // middleware 中间件链：请求体限额 → 审计采集 → 鉴权 → 业务处理 → 审计落库。
 func (s *Server) middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 0) 安全响应头：所有响应（含静态资源与错误页）统一附加
+		writeSecurityHeaders(w)
+
 		// 1) 请求体限额（Content-Length 预检）
 		if r.ContentLength > maxBodyBytes {
 			writeError(w, http.StatusRequestEntityTooLarge, "请求体过大")
@@ -273,13 +292,28 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 		}
 
 		// 3) 鉴权：登录接口与登录页静态资源放行
-		if s.sessionFrom(r) == nil && !isPublicPath(r.URL.Path) {
+		sess := s.sessionFrom(r)
+		if sess == nil && !isPublicPath(r.URL.Path) {
 			if strings.HasPrefix(r.URL.Path, "/api/") {
 				writeError(w, http.StatusUnauthorized, "未登录或会话已过期")
 			} else {
 				http.Redirect(w, r, "/login.html", http.StatusFound)
 			}
 			return
+		}
+
+		// 3.5) 强制改密：mustChange 账号仅可访问自身信息/改密/退出，
+		// 避免默认口令长期有效（前端路由拦截可被直接调 API 绕过）
+		if sess != nil && mustChangeRequired(r) {
+			user, err := s.users.findById(sess.UID)
+			if err != nil {
+				s.internalError(w, r, err)
+				return
+			}
+			if user != nil && user.MustChange {
+				writeError(w, http.StatusForbidden, "首次登录必须先修改密码")
+				return
+			}
 		}
 
 		// 4) 业务处理（记录实际状态码供审计使用）
@@ -305,10 +339,39 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 				username = sess.Username
 			}
 		}
-		s.audit.Record(username, ClientIP(r), r.Method, r.URL.Path, r.URL.RawQuery,
+		s.audit.Record(username, s.clientIP.Resolve(r), r.Method, r.URL.Path, r.URL.RawQuery,
 			maskBody(string(reqBody)), status, respBody,
-			time.Since(auditStart).Milliseconds(), ok)
+			time.Since(auditStart).Milliseconds(), ok, username != "")
 	})
+}
+
+// writeSecurityHeaders 附加基础安全响应头。
+// CSP 保留 'unsafe-inline'：登录页含内联 <script>/<style>，且前端使用内联事件属性；
+// 仍可阻断外部脚本域（XSS 无法加载远程 payload）。
+func writeSecurityHeaders(w http.ResponseWriter) {
+	h := w.Header()
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("X-Frame-Options", "DENY")
+	h.Set("Referrer-Policy", "no-referrer")
+	h.Set("Content-Security-Policy",
+		"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "+
+			"img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+}
+
+// mustChangeRequired 判断 mustChange 账号是否被允许访问该请求。
+// 放行范围：自身信息、改密、退出、ECharts 资源；其余 API 一律 403。
+func mustChangeRequired(r *http.Request) bool {
+	if !strings.HasPrefix(r.URL.Path, "/api/") {
+		return false // 静态页面放行，前端据 /api/me 的 mustChange 跳转改密页
+	}
+	if strings.HasPrefix(r.URL.Path, "/api/vendor/") {
+		return false
+	}
+	switch r.URL.Path {
+	case "/api/me", "/api/password", "/api/logout":
+		return false
+	}
+	return true
 }
 
 // isAuditedPath 是否需要记录操作审计。
@@ -353,24 +416,27 @@ func (s *Server) sessionFrom(r *http.Request) *Session {
 	return s.sessions.Get(cookie.Value)
 }
 
-// setSessionCookie 下发会话 Cookie（HttpOnly 阻断脚本窃取，SameSite=Lax 缓解 CSRF）。
-func setSessionCookie(w http.ResponseWriter, id string) {
+// setSessionCookie 下发会话 Cookie（HttpOnly 阻断脚本窃取，SameSite=Lax 缓解 CSRF；
+// TLS 请求追加 Secure，避免明文链路回传会话）。
+func setSessionCookie(w http.ResponseWriter, r *http.Request, id string) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    id,
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   r.TLS != nil,
 		SameSite: http.SameSiteLaxMode,
 	})
 }
 
 // clearSessionCookie 让浏览器立即丢弃会话 Cookie。
-func clearSessionCookie(w http.ResponseWriter) {
+func clearSessionCookie(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   r.TLS != nil,
 		MaxAge:   -1,
 		SameSite: http.SameSiteLaxMode,
 	})

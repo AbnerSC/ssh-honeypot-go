@@ -49,12 +49,12 @@ permissions:
 env:
   IMAGE_NAME: ssh-honeypot-j
   # 自托管 runner 多在国内，注入内部 Go 模块代理加速依赖下载
-  GOPROXY: https://repo.pi.mmxx.fun/repository/go-public,direct
+  GOPROXY: ${{ vars.GOPROXY_URL }}
   # 运行阶段安装 ca-certificates / curl / tzdata 时经公共镜像源加速
   APT_MIRROR: repo.huaweicloud.com
   # buildkit（docker-container driver）拉取镜像不走 docker daemon 的 registry-mirrors，
   # 基础镜像需显式经 Nexus 的 docker 代理仓库拉取，避免 runner 直连 docker.io 超时
-  DOCKER_PROXY: repo.pi.mmxx.fun/docker-public
+  DOCKER_PROXY: ${{ vars.DOCKER_PROXY }}
 
 jobs:
   # 构建一份本地镜像验证运行身份，失败则阻断推送

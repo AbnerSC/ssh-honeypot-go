@@ -122,6 +122,24 @@ func TestShellHistoryCapacity(t *testing.T) {
 	}
 }
 
+// TestSessionHistoryCapacity 会话命令历史（history 命令与 AI 上下文使用）同样固定容量：
+// 单行可达 maxCommandLine，不封顶时长会话内存会无限增长。
+func TestSessionHistoryCapacity(t *testing.T) {
+	st := NewSession("s1", "203.0.113.9", "root", vfs.New("svr01"), "svr01")
+	for i := 0; i < maxSessionHistory+10; i++ {
+		st.AppendHistory("cmd" + strconv.Itoa(i))
+	}
+	if len(st.History) != maxSessionHistory {
+		t.Fatalf("会话历史长度 = %d, want %d", len(st.History), maxSessionHistory)
+	}
+	if got := st.History[len(st.History)-1]; got != "cmd"+strconv.Itoa(maxSessionHistory+9) {
+		t.Fatalf("最新命令未保留: %q", got)
+	}
+	if got := st.History[0]; got != "cmd"+strconv.Itoa(10) {
+		t.Fatalf("最旧命令应被挤出: %q", got)
+	}
+}
+
 func TestSessionUserSanitizeAndPrompt(t *testing.T) {
 	cases := map[string]string{
 		"root":        "root",

@@ -21,6 +21,7 @@ import (
 
 	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/attacklog"
 	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/auth"
+	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/safe"
 	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/shell"
 	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/vfs"
 )
@@ -199,6 +200,9 @@ func (s *Server) untrackConn(conn net.Conn) {
 }
 
 func (s *Server) handleConn(conn net.Conn) {
+	// 攻击者输入会一路流到伪 Shell：任何一处 panic 只允许断开本连接，
+	// 不能让整个进程（其余协议与会话）一起退出。
+	defer safe.Recover(s.opts.Logger, "ssh 连接")
 	defer conn.Close()
 	begin := time.Now()
 
@@ -274,6 +278,7 @@ func (s *Server) publicKeyCallback(meta ssh.ConnMetadata, key ssh.PublicKey) (*s
 
 // keepalive 定期发送 keepalive@openssh.com 全局请求，连续无应答达上限判定死连接并关闭。
 func (s *Server) keepalive(ctx context.Context, conn *ssh.ServerConn) {
+	defer safe.Recover(s.opts.Logger, "ssh 心跳")
 	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
 
@@ -285,6 +290,7 @@ func (s *Server) keepalive(ctx context.Context, conn *ssh.ServerConn) {
 		case <-ticker.C:
 			done := make(chan error, 1)
 			go func() {
+				defer safe.Recover(s.opts.Logger, "ssh 心跳请求")
 				_, _, err := conn.SendRequest("keepalive@openssh.com", true, nil)
 				done <- err
 			}()
@@ -311,6 +317,8 @@ func (s *Server) keepalive(ctx context.Context, conn *ssh.ServerConn) {
 
 // handleSession 处理单个 session 通道的请求流：pty-req、window-change、env、shell、exec。
 func (s *Server) handleSession(newChan ssh.NewChannel, conn *ssh.ServerConn) {
+	// 会话通道在独立 goroutine 中运行，panic 必须就地收敛
+	defer safe.Recover(s.opts.Logger, "ssh session 通道")
 	ch, reqs, err := newChan.Accept()
 	if err != nil {
 		return
@@ -389,6 +397,7 @@ func drainRequests(reqs <-chan *ssh.Request) {
 
 // runShell 运行交互式伪 Shell（protocol=ssh-shell）。
 func (s *Server) runShell(ch ssh.Channel, conn *ssh.ServerConn, username string) {
+	defer safe.Recover(s.opts.Logger, "ssh 交互会话")
 	ip, port := addrParts(conn.RemoteAddr())
 	st := shell.NewSession(s.opts.Events.NewSessionID(), ip, username, s.opts.FS, s.opts.Hostname)
 	s.opts.Events.SessionOpen(st.ID, "ssh-shell", ip, port)
@@ -401,6 +410,7 @@ func (s *Server) runShell(ch ssh.Channel, conn *ssh.ServerConn, username string)
 
 // runExec 执行 exec 命令（protocol=ssh-exec），结束时补 session_close。
 func (s *Server) runExec(ch ssh.Channel, conn *ssh.ServerConn, username, command string) {
+	defer safe.Recover(s.opts.Logger, "ssh exec 会话")
 	begin := time.Now()
 	ip, port := addrParts(conn.RemoteAddr())
 	st := shell.NewSession(s.opts.Events.NewSessionID(), ip, username, s.opts.FS, s.opts.Hostname)

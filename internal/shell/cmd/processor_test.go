@@ -405,3 +405,57 @@ func TestRoutePriority(t *testing.T) {
 		t.Fatalf("AI 不可用时已安装命令应静默: %q", out.Text)
 	}
 }
+
+// TestHeadTailLineLimit head/tail 的 -n 由攻击者控制，必须在分配前钳制到
+// maxHeadLines：否则 `head -n 10000000000 /etc/passwd` 会申请上百 GB 内存，
+// 导致进程被 OOM 杀掉（一条命令即可让全部协议下线）。
+func TestHeadTailLineLimit(t *testing.T) {
+	p := newProcessor()
+	st := newSession()
+	// 先落一个 200000 行的文件，验证截断确实生效
+	if out := p.Execute(st, "seq 1 200000 > /tmp/big.txt"); out.Text != "" {
+		t.Fatalf("准备大文件失败: %+v", out)
+	}
+
+	out := p.Execute(st, "head -n 10000000000 /tmp/big.txt")
+	if n := strings.Count(out.Text, "\n"); n != maxHeadLines {
+		t.Fatalf("head 行数=%d，期望钳制到 %d", n, maxHeadLines)
+	}
+	out = p.Execute(st, "tail -99999999999 /tmp/big.txt")
+	// tail 会跳过文件末尾换行产生的空行，因此只断言「不超上限且确有输出」
+	if n := strings.Count(out.Text, "\n"); n == 0 || n > maxHeadLines {
+		t.Fatalf("tail 行数=%d，期望在 (0, %d] 区间内", n, maxHeadLines)
+	}
+
+	// 小文件仍按实际行数输出，不因上限而多输出
+	p.Execute(st, "echo hi > /tmp/small.txt")
+	if out := p.Execute(st, "head -n 10 /tmp/small.txt"); out.Text != "hi\n" {
+		t.Fatalf("小文件 head 输出=%q", out.Text)
+	}
+}
+
+// TestSelfAppendRedirectBounded `cat f >> f` 每次把文件自我复制一遍，
+// 不加上限时几十次即可把进程内存吃光；容量上限必须让它停下来。
+func TestSelfAppendRedirectBounded(t *testing.T) {
+	p := newProcessor()
+	st := newSession()
+	if out := p.Execute(st, "seq 1 1000 > /tmp/seed.txt"); out.Text != "" {
+		t.Fatalf("准备种子文件失败: %+v", out)
+	}
+
+	sizes := make([]int, 0, 32)
+	for i := 0; i < 32; i++ {
+		p.Execute(st, "cat /tmp/seed.txt >> /tmp/seed.txt")
+		content, _ := st.FS.ReadFile(st.Cwd, "/tmp/seed.txt")
+		sizes = append(sizes, len(content))
+	}
+
+	last := sizes[len(sizes)-1]
+	if last >= 64<<20 {
+		t.Fatalf("自我追加未被限制，文件已增长到 %d 字节", last)
+	}
+	// 触及上限后连续两次追加都不应再增长（后续写入被拒绝）
+	if sizes[len(sizes)-2] != last {
+		t.Fatalf("触及上限后仍能继续增长：%d -> %d", sizes[len(sizes)-2], last)
+	}
+}

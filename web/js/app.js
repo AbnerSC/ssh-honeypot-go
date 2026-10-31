@@ -10,6 +10,16 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g,
     (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const fmtTs = (s) => (s ? String(s).replace('T', ' ').replace(/\.\d+$/, '') : '-');
 
+// 口令强度：与后端 checkPassword 保持一致（≥ 12 位，大写/小写/数字/符号四类中至少三类）。
+// 前端只做即时提示，真正的拦截在服务端。
+const PWD_MIN_LENGTH = 12;
+function passwordWeak(pwd) {
+    if ([...pwd].length < PWD_MIN_LENGTH) return `密码长度至少 ${PWD_MIN_LENGTH} 位`;
+    const classes = [/[A-Z]/, /[a-z]/, /[0-9]/, /[^A-Za-z0-9]/].filter((re) => re.test(pwd)).length;
+    if (classes < 3) return '密码需包含大写字母、小写字母、数字、特殊符号中的至少三种';
+    return '';
+}
+
 /**
  * 生成 <th> 列宽内联样式。
  * 支持两种写法：
@@ -458,7 +468,7 @@ function openUserModal() {
         <div class="modal">
             <div class="modal-head">新增用户</div>
             <div class="field"><label>用户名</label><input id="nu-name" placeholder="字母数字_.-，2-32 位"></div>
-            <div class="field"><label>初始密码</label><input id="nu-pwd" type="password" placeholder="至少 8 位"></div>
+            <div class="field"><label>初始密码</label><input id="nu-pwd" type="password" placeholder="至少 12 位，含大小写/数字/符号三类"></div>
             <div class="field"><label>角色</label>
                 <select id="nu-role"><option value="admin">admin（管理员）</option><option value="viewer">viewer（只读）</option></select>
             </div>
@@ -471,6 +481,8 @@ function openUserModal() {
     document.body.appendChild(mask);
     mask.querySelector('#nu-cancel').onclick = () => mask.remove();
     mask.querySelector('#nu-ok').onclick = async () => {
+        const weak = passwordWeak(mask.querySelector('#nu-pwd').value);
+        if (weak) { mask.querySelector('#nu-err').textContent = weak; return; }
         try {
             await API.post('/api/users', {
                 username: mask.querySelector('#nu-name').value.trim(),
@@ -498,7 +510,7 @@ function openResetPwdModal(uid, username, onDone) {
             <div class="field">
                 <label>新密码</label>
                 <div class="pwd-box">
-                    <input id="rp-pwd" type="password" autocomplete="new-password" placeholder="至少 8 位">
+                    <input id="rp-pwd" type="password" autocomplete="new-password" placeholder="至少 12 位，含大小写/数字/符号三类">
                     <button type="button" class="pwd-eye" data-for="rp-pwd" title="显示/隐藏密码">👁</button>
                 </div>
             </div>
@@ -528,7 +540,8 @@ function openResetPwdModal(uid, username, onDone) {
         inp.focus();
     });
     const submit = async () => {
-        if (pwd.value.length < 8) { err.textContent = '新密码长度至少 8 位'; return; }
+        const weak = passwordWeak(pwd.value);
+        if (weak) { err.textContent = weak; return; }
         if (pwd.value !== pwd2.value) { err.textContent = '两次输入的密码不一致'; return; }
         try {
             await API.put(`/api/users/${uid}/password`, { password: pwd.value, mustChange: true });
@@ -567,7 +580,8 @@ function openPwdModal(forced) {
         const n1 = document.getElementById('pwd-new').value;
         const n2 = document.getElementById('pwd-new2').value;
         const errEl = document.getElementById('pwd-err');
-        if (n1.length < 8) { errEl.textContent = '新密码长度至少 8 位'; return; }
+        const weak = passwordWeak(n1);
+        if (weak) { errEl.textContent = weak; return; }
         if (n1 !== n2) { errEl.textContent = '两次输入的新密码不一致'; return; }
         try {
             await API.put('/api/password', { oldPassword: oldPwd, newPassword: n1 });

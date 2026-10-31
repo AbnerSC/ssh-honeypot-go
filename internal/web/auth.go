@@ -67,14 +67,14 @@ func (a *Auth) login(ip, username, password string) (*loginResult, error) {
 		verifyPassword(password, dummyPasswordHash)
 		a.recordFailure(ip)
 		if a.logger != nil {
-			a.logger.Warn(fmt.Sprintf("Web 控制台登录失败: ip=%s user=%s", ip, username))
+			a.logger.Warn("Web 控制台登录失败", "ip", ip, "user", username)
 		}
 		return &loginResult{Err: "用户名或密码错误"}, nil
 	}
 	if !user.Enabled || !verifyPassword(password, user.PasswordHash) {
 		a.recordFailure(ip)
 		if a.logger != nil {
-			a.logger.Warn(fmt.Sprintf("Web 控制台登录失败: ip=%s user=%s", ip, username))
+			a.logger.Warn("Web 控制台登录失败", "ip", ip, "user", username)
 		}
 		return &loginResult{Err: "用户名或密码错误"}, nil
 	}

@@ -1,6 +1,7 @@
 package vfs
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -176,5 +177,94 @@ func TestChildrenOf(t *testing.T) {
 	}
 	if fs.ChildrenOf(nil) != nil {
 		t.Fatal("nil 节点应返回 nil")
+	}
+}
+
+// TestWriteSizeLimits 写入量必须与攻击者输入解耦：单文件与全库都有硬上限，
+// 否则 `seq 1 100000000 > /tmp/a` 一条命令就能把蜜罐内存吃光（OOM 属致命错误，recover 兜不住）。
+func TestWriteSizeLimits(t *testing.T) {
+	fs := New("svr01")
+
+	// 单文件超过 maxFileBytes：拒绝写入，且原内容保持不变
+	if !fs.Write("/root", "a.txt", "root", "seed") {
+		t.Fatal("首次写入应成功")
+	}
+	if fs.Write("/root", "a.txt", "root", strings.Repeat("x", maxFileBytes+1)) {
+		t.Fatal("超过单文件上限的写入应被拒绝")
+	}
+	if got, _ := fs.ReadFile("/root", "a.txt"); got != "seed" {
+		t.Fatalf("被拒绝的写入不应改动原内容，当前 %d 字节", len(got))
+	}
+
+	// 恰好等于上限应允许，且删除后额度可回收
+	if !fs.Write("/root", "big.txt", "root", strings.Repeat("y", maxFileBytes)) {
+		t.Fatal("等于单文件上限的写入应成功")
+	}
+	if !fs.Remove("/root", "big.txt") {
+		t.Fatal("删除大文件应成功")
+	}
+
+	// 总量超过 maxTotalBytes：逐个写入直到被拒
+	chunk := strings.Repeat("z", maxFileBytes)
+	attempts := maxTotalBytes/maxFileBytes + 4
+	written := 0
+	for i := 0; i < attempts; i++ {
+		if !fs.Write("/root", "f"+strconv.Itoa(i), "root", chunk) {
+			break
+		}
+		written++
+	}
+	if written == 0 || written >= attempts {
+		t.Fatalf("总量上限未生效：成功写入 %d 次", written)
+	}
+
+	// 删除后额度回收，可以继续写入
+	if !fs.Remove("/root", "f0") {
+		t.Fatal("删除应成功")
+	}
+	if !fs.Write("/root", "again.txt", "root", chunk) {
+		t.Fatal("删除后额度应被回收")
+	}
+}
+
+// TestAppendSelfLimit `cat f >> f` 必须被容量上限截断，不能指数放大。
+func TestAppendSelfLimit(t *testing.T) {
+	fs := New("svr01")
+	if !fs.Write("/tmp", "f", "root", strings.Repeat("a", 1024)) {
+		t.Fatal("准备种子文件失败")
+	}
+
+	rejected := false
+	for i := 0; i < 40; i++ {
+		content, _ := fs.ReadFile("/tmp", "f")
+		if !fs.Append("/tmp", "f", "root", content) {
+			rejected = true
+			break
+		}
+	}
+	if !rejected {
+		t.Fatal("自我追加 40 次仍未触及上限，说明上限未生效")
+	}
+	if got, _ := fs.ReadFile("/tmp", "f"); len(got) != maxFileBytes {
+		t.Fatalf("文件应在上限处停住，实际 %d 字节，期望 %d", len(got), maxFileBytes)
+	}
+}
+
+// TestCopyRespectsTotalLimit 深拷贝同样占用总量配额：复制不能绕过写入上限。
+func TestCopyRespectsTotalLimit(t *testing.T) {
+	fs := New("svr01")
+	chunk := strings.Repeat("c", maxFileBytes)
+	if !fs.Write("/tmp", "src", "root", chunk) {
+		t.Fatal("写入源文件失败")
+	}
+	copies := 0
+	for i := 0; i < maxTotalBytes/maxFileBytes+2; i++ {
+		if !fs.Copy("/tmp", "src", "copy"+strconv.Itoa(i)) {
+			break
+		}
+		copies++
+	}
+	if copies >= maxTotalBytes/maxFileBytes+2 {
+		t.Fatalf("复制绕过了总量上限，成功 %d 次", copies)
 	}
 }

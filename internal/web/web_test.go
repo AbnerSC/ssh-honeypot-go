@@ -18,6 +18,13 @@ import (
 	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/store"
 )
 
+// 测试口令：全部满足「12 位 + 大写/小写/数字/符号四类中至少三类」的强度策略。
+const (
+	testNewPassword     = "Admin@45678901"
+	testViewerPassword  = "Viewer@123456"
+	testViewerPassword2 = "Viewer@456789"
+)
+
 // 测试脚手架
 
 func newTestServer(t *testing.T) (*Server, *httptest.Server) {
@@ -128,7 +135,7 @@ func callWithHeader(t *testing.T, client *http.Client, method, url string, paylo
 func loginAdmin(t *testing.T, client *http.Client, baseURL string) {
 	t.Helper()
 	resp, body := call(t, client, http.MethodPost, baseURL+"/api/login",
-		map[string]any{"username": "admin", "password": "admin123"})
+		map[string]any{"username": "admin", "password": defaultAdminPassword})
 	if resp.StatusCode != http.StatusOK || !body.OK {
 		t.Fatalf("默认管理员登录失败: status=%d error=%s", resp.StatusCode, body.Error)
 	}
@@ -173,7 +180,7 @@ func TestLoginAndConsoleAPIs(t *testing.T) {
 
 	// 自助改密：清除强制改密标记
 	resp, body = call(t, client, http.MethodPut, ts.URL+"/api/password",
-		map[string]any{"oldPassword": "admin123", "newPassword": "newpass123"})
+		map[string]any{"oldPassword": defaultAdminPassword, "newPassword": testNewPassword})
 	if resp.StatusCode != http.StatusOK || !body.OK {
 		t.Fatalf("修改密码失败: status=%d error=%s", resp.StatusCode, body.Error)
 	}
@@ -234,7 +241,7 @@ func TestLoginAndConsoleAPIs(t *testing.T) {
 
 	// 新增用户：201 + data.id
 	resp, body = call(t, client, http.MethodPost, ts.URL+"/api/users",
-		map[string]any{"username": "viewer1", "password": "viewer123", "role": RoleViewer, "mustChange": false})
+		map[string]any{"username": "viewer1", "password": testViewerPassword, "role": RoleViewer, "mustChange": false})
 	if resp.StatusCode != http.StatusCreated || !body.OK {
 		t.Fatalf("新增用户失败: status=%d error=%s", resp.StatusCode, body.Error)
 	}
@@ -247,10 +254,10 @@ func TestLoginAndConsoleAPIs(t *testing.T) {
 
 	// 用户名重复 / 非法用户名 / 短密码 / 非法角色
 	cases := []map[string]any{
-		{"username": "viewer1", "password": "viewer123", "role": RoleViewer},
-		{"username": "bad name", "password": "viewer123", "role": RoleViewer},
+		{"username": "viewer1", "password": testViewerPassword, "role": RoleViewer},
+		{"username": "bad name", "password": testViewerPassword, "role": RoleViewer},
 		{"username": "okname", "password": "short", "role": RoleViewer},
-		{"username": "okname2", "password": "viewer123", "role": "superuser"},
+		{"username": "okname2", "password": testViewerPassword, "role": "superuser"},
 	}
 	for _, payload := range cases {
 		resp, body = call(t, client, http.MethodPost, ts.URL+"/api/users", payload)
@@ -286,7 +293,7 @@ func TestLoginAndConsoleAPIs(t *testing.T) {
 	if desc != "修改登录密码" {
 		t.Fatalf("路径描述不符合预期: %q", desc)
 	}
-	if strings.Contains(reqBody, "admin123") || strings.Contains(reqBody, "newpass123") {
+	if strings.Contains(reqBody, defaultAdminPassword) || strings.Contains(reqBody, testNewPassword) {
 		t.Fatalf("审计请求体未脱敏: %s", reqBody)
 	}
 	if !strings.Contains(reqBody, `"oldPassword":"***"`) || !strings.Contains(reqBody, `"newPassword":"***"`) {
@@ -310,20 +317,20 @@ func TestAuditAndUserAdminPermission(t *testing.T) {
 	loginAdmin(t, admin, ts.URL)
 	// 默认管理员首次登录强制改密（服务端拦截其它 API），先完成改密
 	resp, body := call(t, admin, http.MethodPut, ts.URL+"/api/password",
-		map[string]any{"oldPassword": "admin123", "newPassword": "admin456789"})
+		map[string]any{"oldPassword": defaultAdminPassword, "newPassword": testNewPassword})
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("管理员改密失败: %d (%s)", resp.StatusCode, body.Error)
 	}
 
 	resp, body = call(t, admin, http.MethodPost, ts.URL+"/api/users",
-		map[string]any{"username": "viewer1", "password": "viewer123", "role": RoleViewer, "mustChange": false})
+		map[string]any{"username": "viewer1", "password": testViewerPassword, "role": RoleViewer, "mustChange": false})
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("新增 viewer 失败: %s", body.Error)
 	}
 
 	viewer := newClient(t)
 	resp, body = call(t, viewer, http.MethodPost, ts.URL+"/api/login",
-		map[string]any{"username": "viewer1", "password": "viewer123"})
+		map[string]any{"username": "viewer1", "password": testViewerPassword})
 	if resp.StatusCode != http.StatusOK || !body.OK {
 		t.Fatalf("viewer 登录失败: status=%d error=%s", resp.StatusCode, body.Error)
 	}
@@ -419,7 +426,7 @@ func TestLoginFailureLocksIP(t *testing.T) {
 
 	// 第 6 次即使口令正确也应被锁定
 	resp, body := call(t, client, http.MethodPost, ts.URL+"/api/login",
-		map[string]any{"username": "admin", "password": "admin123"})
+		map[string]any{"username": "admin", "password": defaultAdminPassword})
 	if resp.StatusCode != http.StatusUnauthorized || !strings.Contains(body.Error, "已锁定") {
 		t.Fatalf("连续失败应锁定来源 IP，实际 %d (%s)", resp.StatusCode, body.Error)
 	}
@@ -432,14 +439,14 @@ func TestShouldChangePasswordRequiresOldPassword(t *testing.T) {
 
 	// 原密码错误
 	resp, body := call(t, client, http.MethodPut, ts.URL+"/api/password",
-		map[string]any{"oldPassword": "bad", "newPassword": "newpass123"})
+		map[string]any{"oldPassword": "bad", "newPassword": testNewPassword})
 	if resp.StatusCode != http.StatusBadRequest || body.Error != "原密码错误" {
 		t.Fatalf("原密码错误应返回 400，实际 %d (%s)", resp.StatusCode, body.Error)
 	}
 	// 新密码过短
 	resp, body = call(t, client, http.MethodPut, ts.URL+"/api/password",
-		map[string]any{"oldPassword": "admin123", "newPassword": "short"})
-	if resp.StatusCode != http.StatusBadRequest || body.Error != "密码长度至少 8 位" {
+		map[string]any{"oldPassword": defaultAdminPassword, "newPassword": "short"})
+	if resp.StatusCode != http.StatusBadRequest || body.Error != fmt.Sprintf("密码长度至少 %d 位", passwordMinLength) {
 		t.Fatalf("新密码过短应返回 400，实际 %d (%s)", resp.StatusCode, body.Error)
 	}
 }
@@ -591,7 +598,7 @@ func TestMustChangeForcedByServer(t *testing.T) {
 		t.Fatalf("/api/me 应放行，实际 %d", resp.StatusCode)
 	}
 	resp, _ = call(t, client, http.MethodPut, ts.URL+"/api/password",
-		map[string]any{"oldPassword": "admin123", "newPassword": "admin456789"})
+		map[string]any{"oldPassword": defaultAdminPassword, "newPassword": testNewPassword})
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("改密应放行，实际 %d", resp.StatusCode)
 	}
@@ -610,12 +617,12 @@ func TestSessionRevokedOnAccountChange(t *testing.T) {
 	admin := newClient(t)
 	loginAdmin(t, admin, ts.URL)
 	if resp, body := call(t, admin, http.MethodPut, ts.URL+"/api/password",
-		map[string]any{"oldPassword": "admin123", "newPassword": "admin456789"}); resp.StatusCode != http.StatusOK {
+		map[string]any{"oldPassword": defaultAdminPassword, "newPassword": testNewPassword}); resp.StatusCode != http.StatusOK {
 		t.Fatalf("管理员改密失败: %d (%s)", resp.StatusCode, body.Error)
 	}
 
 	resp, body := call(t, admin, http.MethodPost, ts.URL+"/api/users", map[string]any{
-		"username": "viewer2", "password": "viewer123", "role": RoleViewer, "mustChange": false,
+		"username": "viewer2", "password": testViewerPassword, "role": RoleViewer, "mustChange": false,
 	})
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("创建 viewer2 失败: %s", body.Error)
@@ -630,7 +637,7 @@ func TestSessionRevokedOnAccountChange(t *testing.T) {
 	loginViewer := func(client *http.Client) {
 		t.Helper()
 		resp, body := call(t, client, http.MethodPost, ts.URL+"/api/login",
-			map[string]any{"username": "viewer2", "password": "viewer123"})
+			map[string]any{"username": "viewer2", "password": testViewerPassword})
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("viewer2 登录失败: %d (%s)", resp.StatusCode, body.Error)
 		}
@@ -666,14 +673,14 @@ func TestSessionRevokedOnAccountChange(t *testing.T) {
 	loginViewer(viewer)
 	if resp, body := call(t, admin, http.MethodPut,
 		fmt.Sprintf("%s/api/users/%d/password", ts.URL, created.ID),
-		map[string]any{"password": "viewer456", "mustChange": false}); resp.StatusCode != http.StatusOK {
+		map[string]any{"password": testViewerPassword2, "mustChange": false}); resp.StatusCode != http.StatusOK {
 		t.Fatalf("重置密码失败: %d (%s)", resp.StatusCode, body.Error)
 	}
 	assertRevoked(viewer, "重置密码")
 
 	// 新口令登录 → 删除用户 → 旧会话 401
 	resp, body = call(t, viewer, http.MethodPost, ts.URL+"/api/login",
-		map[string]any{"username": "viewer2", "password": "viewer456"})
+		map[string]any{"username": "viewer2", "password": testViewerPassword2})
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("新口令登录失败: %d (%s)", resp.StatusCode, body.Error)
 	}
@@ -690,11 +697,11 @@ func TestChangePasswordRevokesOtherSessions(t *testing.T) {
 	admin := newClient(t)
 	loginAdmin(t, admin, ts.URL)
 	if resp, body := call(t, admin, http.MethodPut, ts.URL+"/api/password",
-		map[string]any{"oldPassword": "admin123", "newPassword": "admin456789"}); resp.StatusCode != http.StatusOK {
+		map[string]any{"oldPassword": defaultAdminPassword, "newPassword": testNewPassword}); resp.StatusCode != http.StatusOK {
 		t.Fatalf("管理员改密失败: %d (%s)", resp.StatusCode, body.Error)
 	}
 	if resp, body := call(t, admin, http.MethodPost, ts.URL+"/api/users", map[string]any{
-		"username": "viewer3", "password": "viewer123", "role": RoleViewer, "mustChange": false,
+		"username": "viewer3", "password": testViewerPassword, "role": RoleViewer, "mustChange": false,
 	}); resp.StatusCode != http.StatusCreated {
 		t.Fatalf("创建 viewer3 失败: %s", body.Error)
 	}
@@ -702,14 +709,14 @@ func TestChangePasswordRevokesOtherSessions(t *testing.T) {
 	first, second := newClient(t), newClient(t)
 	for i, client := range []*http.Client{first, second} {
 		resp, body := call(t, client, http.MethodPost, ts.URL+"/api/login",
-			map[string]any{"username": "viewer3", "password": "viewer123"})
+			map[string]any{"username": "viewer3", "password": testViewerPassword})
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("第 %d 个终端登录失败: %d (%s)", i+1, resp.StatusCode, body.Error)
 		}
 	}
 
 	if resp, body := call(t, first, http.MethodPut, ts.URL+"/api/password",
-		map[string]any{"oldPassword": "viewer123", "newPassword": "viewer456"}); resp.StatusCode != http.StatusOK {
+		map[string]any{"oldPassword": testViewerPassword, "newPassword": testViewerPassword2}); resp.StatusCode != http.StatusOK {
 		t.Fatalf("改密失败: %d (%s)", resp.StatusCode, body.Error)
 	}
 	if resp, _ := call(t, first, http.MethodGet, ts.URL+"/api/stats/overview", nil); resp.StatusCode != http.StatusOK {
@@ -736,7 +743,7 @@ func TestForwardedForIgnoredByDefault(t *testing.T) {
 
 	// 换一个伪造来源 IP 并给出正确口令：仍应命中锁定
 	resp, body := callWithHeader(t, client, http.MethodPost, ts.URL+"/api/login",
-		map[string]any{"username": "admin", "password": "admin123"},
+		map[string]any{"username": "admin", "password": defaultAdminPassword},
 		map[string]string{"X-Forwarded-For": "203.0.113.200"})
 	if resp.StatusCode != http.StatusUnauthorized || !strings.Contains(body.Error, "已锁定") {
 		t.Fatalf("伪造转发头绕过了登录锁定，实际 %d (%s)", resp.StatusCode, body.Error)
@@ -761,7 +768,7 @@ func TestTrustedProxyResolvesForwardedFor(t *testing.T) {
 	client := newClient(t)
 
 	resp, body := callWithHeader(t, client, http.MethodPost, ts.URL+"/api/login",
-		map[string]any{"username": "admin", "password": "admin123"},
+		map[string]any{"username": "admin", "password": defaultAdminPassword},
 		map[string]string{"X-Forwarded-For": "45.33.32.156"})
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("受信代理下登录失败: %d (%s)", resp.StatusCode, body.Error)
@@ -1106,5 +1113,57 @@ func TestTopLocationsWithoutCountryColumn(t *testing.T) {
 	}
 	if len(top) != 1 || top[0]["name"] != "South" {
 		t.Errorf("缺 country 列时应退化为首段推断，实际: %v", top)
+	}
+}
+
+// TestRecoverMiddlewareIsolatesPanic 单个处理器 panic 必须只影响本次请求：
+// 返回 500 而不是终止整个进程（否则控制台与同进程的蜜罐会一起下线）。
+func TestRecoverMiddlewareIsolatesPanic(t *testing.T) {
+	srv, _ := newTestServer(t)
+	h := srv.recoverMiddleware(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		panic("boom")
+	}))
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/boom", nil))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("panic 后状态码=%d，期望 500", rec.Code)
+	}
+
+	// 已写出响应的处理器 panic 时不得重复写状态码（保持原有响应与状态）
+	h2 := srv.recoverMiddleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusTeapot)
+		panic("boom")
+	}))
+	rec2 := httptest.NewRecorder()
+	h2.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/api/boom2", nil))
+	if rec2.Code != http.StatusTeapot {
+		t.Fatalf("已写出响应后不应被改写，状态码=%d", rec2.Code)
+	}
+}
+
+// TestCheckPasswordPolicy 口令强度：长度≥ 12，且大写字母、小写字母、数字、
+// 特殊符号四类中至少包含三类（默认管理员口令必须自身达标）。
+func TestCheckPasswordPolicy(t *testing.T) {
+	const (
+		errTooShort = "密码长度至少 12 位"
+		errTooWeak  = "密码需包含大写字母、小写字母、数字、特殊符号中的至少三种"
+	)
+	cases := []struct{ name, pwd, want string }{
+		{"空口令", "", errTooShort},
+		{"11 位但四类全含", "Abcdef@1234", errTooShort},
+		{"12 位但仅小写", "abcdefghijkl", errTooWeak},
+		{"12 位但仅大小写", "Abcdefghijkl", errTooWeak},
+		{"16 位但仅数字", "1234567890123456", errTooWeak},
+		{"12 位三类（大写/小写/数字）", "Abcdefgh1234", ""},
+		{"12 位三类（小写/数字/符号）", "abcdefgh123!", ""},
+		{"四类全含", "Abcdef@12345", ""},
+		{"非 ASCII 字符计入符号类", "密码Abcdef1234", ""},
+		{"默认管理员口令", defaultAdminPassword, ""},
+	}
+	for _, c := range cases {
+		if got := checkPassword(c.pwd); got != c.want {
+			t.Errorf("%s: checkPassword = %q, 期望 %q", c.name, got, c.want)
+		}
 	}
 }

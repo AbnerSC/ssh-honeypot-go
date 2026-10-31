@@ -20,6 +20,7 @@ import (
 
 	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/attacklog"
 	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/auth"
+	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/safe"
 	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/shell"
 	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/vfs"
 )
@@ -201,6 +202,9 @@ func (s *Server) untrackConn(conn net.Conn) {
 // handleConn 认证 + 伪 Shell。session_close 只由一处记录：
 // 认证失败路径由本函数补记，进入伪 Shell 后由 shell.Shell.Close 负责。
 func (s *Server) handleConn(conn net.Conn) {
+	// 协议报文与登录名/口令完全来自攻击者：任何解析 panic 只断开本连接，
+	// 不能让整个进程（其余协议与会话）一起退出。
+	defer safe.Recover(s.opts.Logger, "telnet 连接")
 	ip, port := addrParts(conn.RemoteAddr())
 	sid := s.opts.Events.NewSessionID()
 	s.opts.Events.SessionOpen(sid, "telnet", ip, port)

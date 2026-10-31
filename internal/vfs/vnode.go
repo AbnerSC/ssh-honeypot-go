@@ -93,11 +93,6 @@ func (n *Node) Content() string {
 	return n.content
 }
 
-// SetContent 覆盖文件内容。
-func (n *Node) SetContent(c string) {
-	n.content = c
-}
-
 // Size 文件字节数（UTF-8 字节数）；目录固定 4096。
 // 不修改节点，可在读锁下并发调用。
 func (n *Node) Size() int {

@@ -115,6 +115,13 @@ func (p *Processor) cat(st *shell.Session, args []string) string {
 	return stripTrailing(sb.String())
 }
 
+// maxHeadLines head/tail 单次输出的行数上限。
+//
+// -n 的数值完全由攻击者控制：不加上限时 `head -n 10000000000 /etc/passwd`
+// 会让 make([]string, 0, n) 申请上百 GB 内存，Go 运行时的 OOM/越界属致命错误
+// 无法 recover，一条命令即可让全部协议下线。
+const maxHeadLines = 100000
+
 // headTail head/tail：支持 -n N 与 -N，默认 10 行。
 func (p *Processor) headTail(st *shell.Session, args []string, isTail bool) string {
 	n := 10
@@ -142,6 +149,10 @@ func (p *Processor) headTail(st *shell.Session, args []string, isTail bool) stri
 	if len(files) == 0 {
 		return ""
 	}
+	// 分配前钳制：容量不能与攻击者给出的 n 成正比
+	if n > maxHeadLines {
+		n = maxHeadLines
+	}
 
 	cmdName := "head"
 	if isTail {
@@ -160,7 +171,8 @@ func (p *Processor) headTail(st *shell.Session, args []string, isTail bool) stri
 		}
 		content, _ := st.FS.ReadFile(st.Cwd, f)
 		lines := splitLines(content)
-		pick := make([]string, 0, n)
+		// 再按实际行数收窄，避免小文件也按上限预分配
+		pick := make([]string, 0, min(n, len(lines)))
 		for i := 0; i < len(lines); i++ {
 			keep := i < n
 			if isTail {

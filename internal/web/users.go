@@ -23,9 +23,12 @@ const (
 )
 
 // 首次部署自动创建的默认管理员（强制首次登录改密）。
+//
+// 初始口令必须自身满足强度策略（12 位、大写/小写/数字/符号四类），
+// 否则部署后到首次登录之间的窗口里，默认口令本身就是一条公开的弱口令入口。
 const (
 	defaultAdminUsername = "admin"
-	defaultAdminPassword = "admin123"
+	defaultAdminPassword = "Yx63rwpHMo#jZC"
 )
 
 // PBKDF2-HMAC-SHA256 参数，与 Java 版 UserRepository.Passwords 保持一致。

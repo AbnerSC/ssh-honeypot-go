@@ -4,7 +4,7 @@
 // 用法：
 //
 //	conformance db-diff  -java <java库副本> -go <go库>
-//	conformance api-diff -java <java控制台URL> -go <go控制台URL> [-user admin] [-pass admin123]
+//	conformance api-diff -java <java控制台URL> -go <go控制台URL> [-user admin] [-pass <管理员口令>]
 //
 // db-diff 只读打开两侧数据库，不写入任何内容；api-diff 只调用只读接口
 // （以及 login/logout 会话接口），不会修改业务数据。
@@ -53,7 +53,7 @@ func printUsage(w io.Writer) {
             conformance db-diff -java db-java/database.db -go db-go/database.db
   api-diff  比对双栈 Web 控制台的响应结构（含未登录态）
             conformance api-diff -java http://127.0.0.1:8080 -go http://127.0.0.1:18080 \
-                                 -user admin -pass admin123
+                                 -user admin -pass '<管理员口令>'
 
 退出码: 0 一致; 1 存在差异; 2 用法或运行错误
 `)

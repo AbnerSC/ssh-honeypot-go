@@ -10,8 +10,8 @@ import (
 	"strings"
 )
 
-// Default 源码基线版本号。Go 版自 2.0.0 起，与 Java 版 1.2.1 区分。
-const Default = "2.0.0"
+// Default 源码基线版本号。Go 版自 2.0.0 起。
+const Default = "2.0.3"
 
 // Info 一组构建信息。
 type Info struct {

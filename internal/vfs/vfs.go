@@ -8,11 +8,27 @@ import (
 	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/fakeenv"
 )
 
+// 虚拟文件系统容量上限。
+//
+// 虚拟磁盘的所有写入都来自攻击者：不设上限时 `seq 1 100000000 > /tmp/a`
+// 能让单条命令申请数百 MB，而「先写一个小文件再反复 cat f >> f」还能指数放大。
+// Go 运行时的 OOM 属致命错误，recover 兜不住，所以写入量必须在分配之前
+// 就与攻击者输入解耦。
+const (
+	// maxFileBytes 单个文件的内容上限（4 MiB）。
+	maxFileBytes = 4 << 20
+	// maxTotalBytes 整个文件系统的内容总量上限（16 MiB）。
+	// 同一个 FS 实例被所有协议、所有会话共享，这条上限就是蜜罐的内存天花板。
+	maxTotalBytes = 16 << 20
+)
+
 // FS 内存虚拟文件系统。
 type FS struct {
 	mu       sync.RWMutex
 	root     *Node
 	hostname string
+	// used 当前全部文件内容的总字节数，用于总量配额核算（受 mu 保护）。
+	used int
 }
 
 // New 构造伪装成一台常见 Linux 服务器的文件系统。
@@ -20,6 +36,7 @@ type FS struct {
 func New(hostname string) *FS {
 	f := &FS{hostname: hostname}
 	f.root = f.build()
+	f.used = treeBytes(f.root)
 	return f
 }
 
@@ -208,15 +225,43 @@ func (f *FS) Remove(cwd, p string) bool {
 	if parent == nil || !parent.Dir || name == "" {
 		return false
 	}
-	if parent.Child(name) == nil {
+	node := parent.Child(name)
+	if node == nil {
 		return false
 	}
+	f.used -= treeBytes(node)
 	delete(parent.children, name)
 	return true
 }
 
 // Write 写入/创建文件内容：文件不存在则创建，存在则覆盖。
+// 超过 maxFileBytes 或 maxTotalBytes 时拒绝写入并返回 false（原内容保持不变）。
 func (f *FS) Write(cwd, p, user, content string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	parent, name := f.parentOf(cwd, p)
+	if parent == nil || !parent.Dir || name == "" {
+		return false
+	}
+	if existing := parent.Child(name); existing != nil {
+		if existing.Dir {
+			return false
+		}
+		return f.commitLocked(existing, content)
+	}
+	node := newFile(name, "rw-r--r--", user, "")
+	if !f.commitLocked(node, content) {
+		return false
+	}
+	parent.Add(node)
+	return true
+}
+
+// Append 追加写入文件内容：文件不存在则创建，存在则追加；容量上限与 Write 相同。
+//
+// `>>` 重定向必须走这里：若按「读出全文 + 拼接 + 整体覆盖」实现，
+// `cat f >> f` 每执行一次文件就翻倍，几十次即可把进程内存吃光。
+func (f *FS) Append(cwd, p, user, text string) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	parent, name := f.parentOf(cwd, p)
@@ -225,14 +270,53 @@ func (f *FS) Write(cwd, p, user, content string) bool {
 	}
 	existing := parent.Child(name)
 	if existing == nil {
-		parent.Add(newFile(name, "rw-r--r--", user, content))
+		node := newFile(name, "rw-r--r--", user, "")
+		if !f.commitLocked(node, text) {
+			return false
+		}
+		parent.Add(node)
 		return true
 	}
-	if existing.Dir {
+	if existing.Dir || !f.fitsLocked(len(existing.content), len(text)) {
 		return false
 	}
-	existing.SetContent(content)
+	existing.content += text
+	f.used += len(text)
 	return true
+}
+
+// fitsLocked 判断在 oldLen 字节基础上再增加 delta 字节是否仍在上限内。
+func (f *FS) fitsLocked(oldLen, delta int) bool {
+	if delta <= 0 {
+		return true
+	}
+	return oldLen+delta <= maxFileBytes && f.used+delta <= maxTotalBytes
+}
+
+// commitLocked 把 content 落到 node 上，覆盖前先校验容量（node 允许尚未挂载）。
+func (f *FS) commitLocked(node *Node, content string) bool {
+	oldLen := len(node.content)
+	if delta := len(content) - oldLen; !f.fitsLocked(oldLen, delta) {
+		return false
+	}
+	f.used += len(content) - oldLen
+	node.content = content
+	return true
+}
+
+// treeBytes 统计节点子树的内容字节数（复制与删除时核算配额）。
+func treeBytes(n *Node) int {
+	if n == nil {
+		return 0
+	}
+	if !n.Dir {
+		return len(n.content)
+	}
+	sum := 0
+	for _, c := range n.children {
+		sum += treeBytes(c)
+	}
+	return sum
 }
 
 // Move 移动/重命名节点，成功返回 true。
@@ -285,12 +369,24 @@ func (f *FS) Copy(cwd, src, dst string) bool {
 	}
 	if existing := dstParent.Child(dstName); existing != nil && existing.Dir {
 		// 目标是目录：拷贝进其中，保持原名
-		delete(existing.children, node.Name)
-		existing.Add(node.clone(node.Name))
-		return true
+		return f.placeLocked(existing, node.Name, node)
 	}
-	delete(dstParent.children, dstName)
-	dstParent.Add(node.clone(dstName))
+	return f.placeLocked(dstParent, dstName, node)
+}
+
+// placeLocked 把 src 的深拷贝挂到 parent/name 上（覆盖同名节点）。
+// 克隆前先按总量上限判断能否容纳，避免为大目录复制白付一次内存。
+func (f *FS) placeLocked(parent *Node, name string, src *Node) bool {
+	size := treeBytes(src)
+	if old := parent.Child(name); old != nil {
+		size -= treeBytes(old)
+	}
+	if f.used+size > maxTotalBytes {
+		return false
+	}
+	f.used += size
+	delete(parent.children, name)
+	parent.Add(src.clone(name))
 	return true
 }
 

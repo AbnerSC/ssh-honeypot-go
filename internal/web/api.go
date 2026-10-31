@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 // usernamePattern 用户名规则：字母、数字、下划线、点、短横线，长度 2-32。
@@ -650,10 +651,47 @@ func (s *Server) handleUserDelete(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// checkPassword 校验口令长度（按字符数，与 Java 版 String.length 语义接近）；合法返回空串。
+// 控制台口令强度策略。
+//
+// 控制台往往直接暴露在公网，一旦弱口令被撞库命中等同于全部攻击日志与取证数据泄露，
+// 因此长度与字符种类必须同时达标：长度≥ 12，且大写字母、小写字母、数字、
+// 特殊符号四类中至少包含三类。
+const (
+	passwordMinLength  = 12
+	passwordMinClasses = 3
+)
+
+// checkPassword 校验口令强度（按字符数，与 Java 版 String.length 语义接近）；合法返回空串。
 func checkPassword(password string) string {
-	if len([]rune(password)) < 8 {
-		return "密码长度至少 8 位"
+	if len([]rune(password)) < passwordMinLength {
+		return fmt.Sprintf("密码长度至少 %d 位", passwordMinLength)
+	}
+	if passwordClassCount(password) < passwordMinClasses {
+		return "密码需包含大写字母、小写字母、数字、特殊符号中的至少三种"
 	}
 	return ""
+}
+
+// passwordClassCount 统计口令覆盖的字符种类数（大写 / 小写 / 数字 / 其它符号）。
+func passwordClassCount(password string) int {
+	var upper, lower, digit, other bool
+	for _, r := range password {
+		switch {
+		case unicode.IsUpper(r):
+			upper = true
+		case unicode.IsLower(r):
+			lower = true
+		case unicode.IsDigit(r):
+			digit = true
+		default:
+			other = true
+		}
+	}
+	n := 0
+	for _, hit := range []bool{upper, lower, digit, other} {
+		if hit {
+			n++
+		}
+	}
+	return n
 }

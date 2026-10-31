@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/attacklog"
+	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/safe"
 )
 
 const (
@@ -173,6 +174,8 @@ func (s *Server) untrackConn(nc net.Conn) {
 
 // handleConn 限流 + 会话开闭日志 + 超时设置，然后交给协议处理器。
 func (s *Server) handleConn(nc net.Conn) {
+	// 报文解析完全面向攻击者输入：panic 只断开本连接，不能拖垮整个进程。
+	defer safe.Recover(s.opts.Logger, s.label+" 连接")
 	ip, port := addrParts(nc.RemoteAddr())
 	c := &conn{
 		srv:   s,

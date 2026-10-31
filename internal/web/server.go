@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/geo"
+	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/safe"
 	webassets "git.pi.mmxx.fun/tool/ssh-honeypot-go/web"
 )
 
@@ -237,7 +238,27 @@ func (s *Server) routes() http.Handler {
 	// 前端静态资源（页面）
 	mux.HandleFunc("/", s.handleStatic)
 
-	return s.middleware(mux)
+	return s.recoverMiddleware(s.middleware(mux))
+}
+
+// recoverMiddleware 最外层兜底：单个请求的 panic 只影响本次请求，
+// 不允许把控制台（以及与其同进程的蜜罐）一起带走。
+// 蜜罐的请求体、查询参数、路径全部由攻击者控制，没有这层兜底时
+// 一个越界访问就能让全部协议停止服务。
+func (s *Server) recoverMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		recorder := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		defer func() {
+			// recover 必须在本 deferred 函数里直接调用，不能包进其他函数
+			if rec := recover(); rec != nil {
+				safe.LogPanic(s.logger, r.Method+" "+r.URL.Path, rec)
+				if !recorder.wrote {
+					writeError(recorder, http.StatusInternalServerError, "内部错误")
+				}
+			}
+		}()
+		next.ServeHTTP(recorder, r)
+	})
 }
 
 // bodyKey 缓存审计采集阶段读取的请求体，避免业务处理器二次读取。

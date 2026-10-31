@@ -39,7 +39,9 @@ func (h *lineHandler) Handle(_ context.Context, r slog.Record) error {
 	b.WriteByte(' ')
 	b.WriteString(levelLabel(r.Level))
 	b.WriteByte(' ')
-	b.WriteString(r.Message)
+	// 消息里可能含攻击者可控内容（Web 登录用户名、命令等）：必须去掉换行，
+	// 否则一条日志记录就能伪造出多行，污染取证与告警
+	b.WriteString(sanitizeLine(r.Message))
 	for _, a := range h.attrs {
 		h.writeAttr(&b, a)
 	}
@@ -96,15 +98,58 @@ func (h *lineHandler) writeAttr(b *strings.Builder, a slog.Attr) {
 }
 
 // formatAttrValue 输出属性值：字符串原样输出，含空白的值加双引号便于区分字段边界。
+// 两条分支都保证不会把换行等控制字符原样写进去（日志注入）。
 func formatAttrValue(v slog.Value) string {
 	if v.Kind() == slog.KindString {
 		s := v.String()
 		if strings.ContainsAny(s, " \t\n\r") {
 			return fmt.Sprintf("%q", s)
 		}
+		return sanitizeLine(s)
+	}
+	return sanitizeLine(fmt.Sprint(v.Any()))
+}
+
+// hexDigits 控制字符转义用的十六进制字符表。
+const hexDigits = "0123456789abcdef"
+
+// sanitizeLine 把控制字符转成可见转义，保证一条日志记录只占一行。
+//
+// 日志里会混入攻击者可控的数据（Web 登录用户名、口令、未知命令、panic 值等），
+// 其中可能含换行或 ANSI 控制序列：不转义就能伪造整行日志、误导排查与告警。
+func sanitizeLine(s string) string {
+	dirty := false
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c < 0x20 || c == 0x7f {
+			dirty = true
+			break
+		}
+	}
+	if !dirty {
 		return s
 	}
-	return fmt.Sprint(v.Any())
+	var b strings.Builder
+	b.Grow(len(s) + 16)
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch c {
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		default:
+			if c < 0x20 || c == 0x7f {
+				b.WriteString(`\x`)
+				b.WriteByte(hexDigits[c>>4])
+				b.WriteByte(hexDigits[c&0x0f])
+				continue
+			}
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
 }
 
 // levelLabel 固定 5 字符宽度，保证日志列对齐。

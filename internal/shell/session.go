@@ -32,6 +32,22 @@ type Session struct {
 // userNameCleaner 用户名清洗：仅保留常规 Linux 用户名字符。
 var userNameCleaner = regexp.MustCompile(`[^a-zA-Z0-9._-]`)
 
+// maxSessionHistory 会话命令历史（history 命令与 AI 上下文使用）保留条数。
+//
+// 与行编辑历史表 maxHistory 分开：history 记录的是「整行输入」，单行可达
+// maxCommandLine（8192 字节），攻击者持续输入多命令行即可让每会话内存无限增长
+// （SSH/Telnet 各 50 个并发会话可成倍放大），因此必须封顶。
+const maxSessionHistory = 1000
+
+// AppendHistory 追加一条已执行的整行命令；超过上限时丢弃最旧的记录。
+func (s *Session) AppendHistory(line string) {
+	if len(s.History) >= maxSessionHistory {
+		copy(s.History, s.History[len(s.History)-maxSessionHistory+1:])
+		s.History = s.History[:maxSessionHistory-1]
+	}
+	s.History = append(s.History, line)
+}
+
 // NewSession 构造会话状态。
 //
 // 用户名清洗是必需的：攻击者可提交任意字符串作用户名，未清洗的路径分隔符/控制字符

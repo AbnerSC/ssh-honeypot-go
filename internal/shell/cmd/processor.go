@@ -41,7 +41,7 @@ func (p *Processor) Execute(st *shell.Session, line string) shell.Output {
 	if line == "" {
 		return shell.Output{}
 	}
-	st.History = append(st.History, line)
+	st.AppendHistory(line)
 	if p.events != nil {
 		p.events.Command(st.ID, st.IP, st.Username, line)
 	}
@@ -456,14 +456,17 @@ func (p *Processor) dispatch(st *shell.Session, name string, args []string, cmdl
 	return text(p.aiFallback(st, cmdline, name))
 }
 
-// writeRedirect 把输出写入虚拟文件（> 覆盖，>> 追加），路径不可写时回真实 bash 的报错。
+// writeRedirect 把输出写入虚拟文件（> 覆盖，>> 追加），路径不可写或超出容量上限时
+// 只留下一行取证日志：攻击者持续写入不可能无限占内存。
 func (p *Processor) writeRedirect(st *shell.Session, path, text string, appendMode bool) {
+	ok := false
 	if appendMode {
-		if old, ok := st.FS.ReadFile(st.Cwd, path); ok {
-			text = old + text
-		}
+		// 必须走 Append：先读全文再覆盖写会让 `cat f >> f` 指数放大
+		ok = st.FS.Append(st.Cwd, path, st.Username, text)
+	} else {
+		ok = st.FS.Write(st.Cwd, path, st.Username, text)
 	}
-	if !st.FS.Write(st.Cwd, path, st.Username, text) {
+	if !ok {
 		// 写失败时攻击者看不到内容，仅留日志便于取证
 		if p.events != nil {
 			p.events.Command(st.ID, st.IP, st.Username, "[重定向失败] "+path)

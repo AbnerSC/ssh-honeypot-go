@@ -10,7 +10,7 @@ import (
 
 	_ "modernc.org/sqlite" // 与生产同驱动，只读打开
 
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/config"
+	"ssh-honeypot-go/internal/config"
 )
 
 // checkDBTables 自检期望存在的表：5 张攻击日志表 + 5 张预聚合统计表 + 2 张控制台系统表。

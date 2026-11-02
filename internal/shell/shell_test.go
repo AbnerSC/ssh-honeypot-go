@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/vfs"
+	"ssh-honeypot-go/internal/vfs"
 )
 
 // stubProcessor 把每条输入原样回显，便于断言行编辑行为。

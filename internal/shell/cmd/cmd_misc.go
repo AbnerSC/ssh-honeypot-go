@@ -6,8 +6,8 @@ import (
 	"strconv"
 	"strings"
 
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/fakeenv"
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/shell"
+	"ssh-honeypot-go/internal/fakeenv"
+	"ssh-honeypot-go/internal/shell"
 )
 
 // echo 回显参数（-n 不换行，支持 \n / \t 转义）。

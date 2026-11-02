@@ -4,7 +4,7 @@ import (
 	"regexp"
 	"strings"
 
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/vfs"
+	"ssh-honeypot-go/internal/vfs"
 )
 
 // Session 单个攻击会话的状态：登录用户、当前目录、命令历史。

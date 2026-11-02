@@ -4,8 +4,8 @@ import (
 	"strings"
 	"testing"
 
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/shell"
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/vfs"
+	"ssh-honeypot-go/internal/shell"
+	"ssh-honeypot-go/internal/vfs"
 )
 
 // newProcessor 构造关闭延迟模拟的命令解释器，避免测试等待。

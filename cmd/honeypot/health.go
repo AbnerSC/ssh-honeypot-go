@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/config"
+	"ssh-honeypot-go/internal/config"
 )
 
 // healthDialTimeout 单端口探测超时：健康检查总耗时必须远小于容器探针 timeout。

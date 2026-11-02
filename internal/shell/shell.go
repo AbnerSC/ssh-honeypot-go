@@ -8,7 +8,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/attacklog"
+	"ssh-honeypot-go/internal/attacklog"
 )
 
 // banner 登录横幅：内容固定，编译期拼接一次复用。

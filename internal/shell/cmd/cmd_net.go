@@ -6,8 +6,8 @@ import (
 	"strings"
 	"time"
 
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/fakeenv"
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/shell"
+	"ssh-honeypot-go/internal/fakeenv"
+	"ssh-honeypot-go/internal/shell"
 )
 
 // download wget/curl：典型恶意软件下载行为，重点记录 URL 并落地假文件。

@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/attacklog"
+	"ssh-honeypot-go/internal/attacklog"
 )
 
 // sweepInterval 过期条目清扫周期，防止只失败一次就消失的 IP 残留导致 Map 无限增长。

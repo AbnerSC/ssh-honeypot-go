@@ -18,7 +18,6 @@
 #   docker buildx build --platform linux/amd64,linux/arm64 \
 #     -t ssh-honeypot-j:latest --push .
 # 国内环境构建可注入模块代理与 apt 镜像源：
-#   --build-arg GOPROXY=https://repo.pi.mmxx.fun/repository/go-public,direct
 #   --build-arg APT_MIRROR=repo.huaweicloud.com
 # =====================================================================
 

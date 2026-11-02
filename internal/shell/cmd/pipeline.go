@@ -19,7 +19,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/shell"
+	"ssh-honeypot-go/internal/shell"
 )
 
 // redirection 一行命令中的输出重定向解析结果。

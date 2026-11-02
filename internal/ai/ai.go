@@ -27,7 +27,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/fakeenv"
+	"ssh-honeypot-go/internal/fakeenv"
 )
 
 const (

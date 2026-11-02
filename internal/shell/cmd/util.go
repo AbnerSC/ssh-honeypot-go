@@ -5,7 +5,7 @@ import (
 	"strings"
 	"unicode"
 
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/shell"
+	"ssh-honeypot-go/internal/shell"
 )
 
 // 时间格式：与 Java 版 DateTimeFormatter 模板一一对应。

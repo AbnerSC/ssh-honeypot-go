@@ -5,8 +5,8 @@ import (
 	"strings"
 	"time"
 
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/fakeenv"
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/shell"
+	"ssh-honeypot-go/internal/fakeenv"
+	"ssh-honeypot-go/internal/shell"
 )
 
 // archiveExt 归档扩展名（解包时用于去掉后缀生成目录名）。

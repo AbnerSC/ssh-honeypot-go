@@ -2,10 +2,6 @@
 # Gitea Actions：Docker 镜像构建并推送到自建 Nexus 仓库
 # （仅 linux/amd64）
 #
-# 与 .github/workflows/docker-image.yml 分工：
-#   - GitHub 侧工作流只会被 GitHub 读取，推送到 Docker Hub
-#   - 本文件只会被 Gitea Actions 读取，推送到自建 Nexus
-#
 # 触发方式：
 #   - 提交 PR 时构建校验镜像并检查运行身份（非 root），不推送
 #   - 推送 main 分支自动构建，仅推送 latest 标签
@@ -22,9 +18,7 @@
 #       NEXUS_USERNAME   Nexus 账号
 #       NEXUS_PASSWORD   Nexus 密码
 #   - 已注册可用的 act_runner（标签 golang），且 runner 可执行 docker 命令
-#   - buildx 构建固定使用宿主机网络（driver-opts: network=host），因为内网
-#     Nexus 域名（repo.pi.mmxx.fun 等）只由宿主机侧 DNS 解析，构建容器默认
-#     的桥接网络里解析会超时，导致 go mod download 失败
+#   - buildx 构建固定使用宿主机网络（driver-opts: network=host）
 #
 # 代码质量门禁（gofmt / go vet / go test -race）不在本工作流内执行，
 # 需在本地或其它流水线中自行保证。

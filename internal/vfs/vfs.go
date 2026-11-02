@@ -5,7 +5,7 @@ import (
 	"strings"
 	"sync"
 
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/fakeenv"
+	"ssh-honeypot-go/internal/fakeenv"
 )
 
 // 虚拟文件系统容量上限。

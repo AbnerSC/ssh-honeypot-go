@@ -18,7 +18,7 @@ import (
 	"io"
 	"os"
 
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/conformance"
+	"ssh-honeypot-go/internal/conformance"
 )
 
 func main() {

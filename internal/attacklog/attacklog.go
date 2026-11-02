@@ -21,8 +21,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/geo"
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/store"
+	"ssh-honeypot-go/internal/geo"
+	"ssh-honeypot-go/internal/store"
 )
 
 const (

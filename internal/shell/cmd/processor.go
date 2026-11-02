@@ -9,9 +9,9 @@ import (
 	"strconv"
 	"strings"
 
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/attacklog"
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/fakeenv"
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/shell"
+	"ssh-honeypot-go/internal/attacklog"
+	"ssh-honeypot-go/internal/fakeenv"
+	"ssh-honeypot-go/internal/shell"
 )
 
 // seqSeparators 命令序列分隔符（; 、&& 与 ||）。

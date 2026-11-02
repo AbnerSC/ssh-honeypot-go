@@ -24,9 +24,9 @@ import (
 	"sync"
 	"time"
 
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/geo"
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/safe"
-	webassets "git.pi.mmxx.fun/tool/ssh-honeypot-go/web"
+	"ssh-honeypot-go/internal/geo"
+	"ssh-honeypot-go/internal/safe"
+	webassets "ssh-honeypot-go/web"
 )
 
 // maxBodyBytes 请求体大小上限：控制台请求体均为小 JSON，超过即拒绝，
@@ -157,8 +157,7 @@ func (s *Server) Start() error {
 	if tcp, ok := ln.Addr().(*net.TCPAddr); ok {
 		port = strconv.Itoa(tcp.Port)
 	}
-	infof(s.logger, "Web 控制台已启动: http://<host>:"+port+"/ （默认管理员 "+
-		defaultAdminUsername+"/"+defaultAdminPassword+"，首次登录强制改密）")
+	infof(s.logger, "Web 控制台已启动: http://<host>:"+port+"/ （管理员账号与初始口令见启动日志提示，首次登录强制改密）")
 	return nil
 }
 

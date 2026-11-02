@@ -10,12 +10,13 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/store"
+	"ssh-honeypot-go/internal/store"
 )
 
 // 测试口令：全部满足「12 位 + 大写/小写/数字/符号四类中至少三类」的强度策略。
@@ -24,6 +25,16 @@ const (
 	testViewerPassword  = "Viewer@123456"
 	testViewerPassword2 = "Viewer@456789"
 )
+
+// testDefaultAdminPasswordValue 测试用固定初始口令（同样满足强度策略）：
+// TestMain 把它注入生产环境的随机生成环节，使用例不依赖随机值
+// （随机生成本身由 users_password_test.go 单独校验）。
+const testDefaultAdminPasswordValue = "Kp7#mQx2vLn8$Rt4"
+
+func TestMain(m *testing.M) {
+	testDefaultAdminPassword = testDefaultAdminPasswordValue
+	os.Exit(m.Run())
+}
 
 // 测试脚手架
 
@@ -131,9 +142,12 @@ func callWithHeader(t *testing.T, client *http.Client, method, url string, paylo
 	return resp, parsed
 }
 
-// loginAdmin 以默认管理员登录。
+// loginAdmin 以默认管理员登录（口令为 bootstrap 注入的固定测试值）。
 func loginAdmin(t *testing.T, client *http.Client, baseURL string) {
 	t.Helper()
+	if defaultAdminPassword != testDefaultAdminPasswordValue {
+		t.Fatalf("默认管理员初始口令未被正确注入: %q", defaultAdminPassword)
+	}
 	resp, body := call(t, client, http.MethodPost, baseURL+"/api/login",
 		map[string]any{"username": "admin", "password": defaultAdminPassword})
 	if resp.StatusCode != http.StatusOK || !body.OK {
@@ -1143,7 +1157,7 @@ func TestRecoverMiddlewareIsolatesPanic(t *testing.T) {
 }
 
 // TestCheckPasswordPolicy 口令强度：长度≥ 12，且大写字母、小写字母、数字、
-// 特殊符号四类中至少包含三类（默认管理员口令必须自身达标）。
+// 特殊符号四类中至少包含三类。
 func TestCheckPasswordPolicy(t *testing.T) {
 	const (
 		errTooShort = "密码长度至少 12 位"
@@ -1159,7 +1173,8 @@ func TestCheckPasswordPolicy(t *testing.T) {
 		{"12 位三类（小写/数字/符号）", "abcdefgh123!", ""},
 		{"四类全含", "Abcdef@12345", ""},
 		{"非 ASCII 字符计入符号类", "密码Abcdef1234", ""},
-		{"默认管理员口令", defaultAdminPassword, ""},
+		{"测试注入的初始口令", testDefaultAdminPasswordValue, ""},
+		{"默认管理员实际口令", defaultAdminPassword, ""},
 	}
 	for _, c := range cases {
 		if got := checkPassword(c.pwd); got != c.want {

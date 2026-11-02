@@ -6,8 +6,8 @@ import (
 	"strings"
 	"time"
 
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/fakeenv"
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/shell"
+	"ssh-honeypot-go/internal/fakeenv"
+	"ssh-honeypot-go/internal/shell"
 )
 
 // helpText `help` 内建命令的输出。

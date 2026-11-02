@@ -5,8 +5,8 @@ import (
 	"strconv"
 	"strings"
 
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/shell"
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/vfs"
+	"ssh-honeypot-go/internal/shell"
+	"ssh-honeypot-go/internal/vfs"
 )
 
 // chmodModeOctal / chmodModeSymbolic chmod 模式校验（对应 Java 的两个正则）。

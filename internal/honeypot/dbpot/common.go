@@ -19,8 +19,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/attacklog"
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/safe"
+	"ssh-honeypot-go/internal/attacklog"
+	"ssh-honeypot-go/internal/safe"
 )
 
 const (

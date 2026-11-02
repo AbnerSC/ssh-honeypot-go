@@ -9,9 +9,9 @@ import (
 	"strings"
 	"testing"
 
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/config"
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/store"
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/web"
+	"ssh-honeypot-go/internal/config"
+	"ssh-honeypot-go/internal/store"
+	"ssh-honeypot-go/internal/web"
 )
 
 func quietLogger() *slog.Logger {

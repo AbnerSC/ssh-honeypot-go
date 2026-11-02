@@ -18,11 +18,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/attacklog"
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/auth"
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/safe"
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/shell"
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/vfs"
+	"ssh-honeypot-go/internal/attacklog"
+	"ssh-honeypot-go/internal/auth"
+	"ssh-honeypot-go/internal/safe"
+	"ssh-honeypot-go/internal/shell"
+	"ssh-honeypot-go/internal/vfs"
 )
 
 // Telnet 协议控制字节（RFC 854/857/858/1073/1091）。

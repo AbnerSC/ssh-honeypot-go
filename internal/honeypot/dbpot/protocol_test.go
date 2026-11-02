@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/attacklog"
+	"ssh-honeypot-go/internal/attacklog"
 )
 
 // 测试脚手架

@@ -40,7 +40,7 @@
 ```yaml
 services:
   ssh-honeypot-j:
-    image: scdm/ssh-honeypot-j:latest
+    image: babyfly/ssh-honeypot-j:latest
     container_name: ssh-honeypot-j
     hostname: ubuntu
     restart: always
@@ -50,6 +50,7 @@ services:
       - ./db:/app/db               # SQLite 库、hostkey
     environment:
       - TZ=Asia/Shanghai
+      - WEB_ADMIN_PASSWORD=        # 显式指定初始口令，优先级高于随机生成
       - AI_ENABLED=false
       - AI_BASE_URL=http://127.0.0.1:8000/v1
       - AI_API_KEY=abcdefg1234567890
@@ -144,7 +145,10 @@ mysql -h127.0.0.1 -P3306 -uroot -p                      # 捕获凭证后返回 
 
 与蜜罐同进程部署，前端内嵌，启动后访问 `http://<主机IP>:8080/`。
 
-- 首次启动自动创建默认管理员 `admin/Yx63rwpHMo#jZC`，登录后强制修改密码
+- 首次启动自动创建默认管理员 `admin`，初始口令默认随机生成并仅在该次启动日志（控制台 / `docker logs`）中打印一行 WARN，不写入配置文件；
+  重启后不再重复打印，运维需在该次启动完成首登改密（首次登录强制修改密码）；口令遗失时可用其它管理员账号在「系统用户管理」里重置
+- 可选环境变量 `WEB_ADMIN_PASSWORD` 显式指定初始口令（适合容器/自动化编排），优先级高于随机生成；
+  不满足口令强度时自动忽略并回退随机；环境变量指定的口令不会回显到日志
 - 口令强度：≥ 12 位，且大写字母、小写字母、数字、特殊符号四类中至少包含三类（新增用户、重置密码、自助改密均校验）
 - 功能：总览指标与趋势图、协议分布、Top 攻击 IP / 用户名 / 口令 / 归属地；
   会话、登录尝试、命令、恶意下载、IP 锁定五类事件分页查询（支持 IP / 用户名 / 协议 /

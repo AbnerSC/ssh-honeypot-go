@@ -1,4 +1,4 @@
-module git.pi.mmxx.fun/tool/ssh-honeypot-go
+module ssh-honeypot-go
 
 go 1.27
 

@@ -12,7 +12,7 @@ import (
 
 	_ "modernc.org/sqlite"
 
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/geo"
+	"ssh-honeypot-go/internal/geo"
 )
 
 func TestBuildLine(t *testing.T) {

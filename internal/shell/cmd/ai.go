@@ -3,7 +3,7 @@ package cmd
 import (
 	"strings"
 
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/shell"
+	"ssh-honeypot-go/internal/shell"
 )
 
 // AIClient 大模型命令仿真客户端（M6 接入的大模型网关）。

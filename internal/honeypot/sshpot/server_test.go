@@ -14,10 +14,10 @@ import (
 
 	"golang.org/x/crypto/ssh"
 
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/attacklog"
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/auth"
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/shell/cmd"
-	"git.pi.mmxx.fun/tool/ssh-honeypot-go/internal/vfs"
+	"ssh-honeypot-go/internal/attacklog"
+	"ssh-honeypot-go/internal/auth"
+	"ssh-honeypot-go/internal/shell/cmd"
+	"ssh-honeypot-go/internal/vfs"
 )
 
 type testEnv struct {

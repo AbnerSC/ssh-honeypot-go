@@ -1,5 +1,5 @@
 <div style="text-align: center;">
-  <img src="logo.svg" alt="NetGazer Logo" width="200"/>
+  <img src="docs/logo.svg" alt="NetGazer Logo" width="200"/>
 </div>
 
 # NetGazer 网络凝视者（Go 版）
@@ -214,3 +214,11 @@ jq -r 'select(.event=="auth_attempt") | [.ts,.src_ip,.username,.password] | @tsv
 - [x] PostgreSQL
 - [x] Redis
 - [ ] HTTP（Nginx）
+
+## 加入群聊
+
+<p>
+<img src="docs/qrcode_qq.jpg" width="200">
+</p>
+
+> 点击链接加入群聊【AI开发新姿势】：https://qm.qq.com/q/ACxOjcQQqA

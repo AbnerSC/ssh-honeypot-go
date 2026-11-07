@@ -16,13 +16,14 @@ func writeTempConfig(t *testing.T, content string) string {
 	return path
 }
 
-// clearAIEnv 清空全部 AI_* 环境变量，避免宿主机环境影响用例。
-func clearAIEnv(t *testing.T) {
+// clearEnv 清空全部 AI_* 及 WEB_TRUSTED_PROXIES 环境变量，避免宿主机环境影响用例。
+func clearEnv(t *testing.T) {
 	t.Helper()
 	for _, name := range []string{
 		"AI_ENABLED", "AI_BASE_URL", "AI_API_KEY", "AI_MODEL_NAME", "AI_ENABLE_THINKING",
 		"AI_TIMEOUT_SECONDS", "AI_MAX_OUTPUT_CHARS", "AI_MAX_CONCURRENT",
 		"AI_FAILURE_THRESHOLD", "AI_COOLDOWN_SECONDS",
+		"WEB_TRUSTED_PROXIES",
 	} {
 		t.Setenv(name, "")
 	}
@@ -68,7 +69,7 @@ func TestDefaultMatchesJava(t *testing.T) {
 }
 
 func TestLoadMissingFileUsesDefaults(t *testing.T) {
-	clearAIEnv(t)
+	clearEnv(t)
 	cfg, err := Load(filepath.Join(t.TempDir(), "absent.yaml"), nil)
 	if err != nil {
 		t.Fatalf("配置文件缺失不应报错: %v", err)
@@ -79,7 +80,7 @@ func TestLoadMissingFileUsesDefaults(t *testing.T) {
 }
 
 func TestLoadPartialKeepsDefaults(t *testing.T) {
-	clearAIEnv(t)
+	clearEnv(t)
 	path := writeTempConfig(t, `
 hostname: ubuntu
 ssh:
@@ -112,7 +113,7 @@ log:
 }
 
 func TestCredentialsBothForms(t *testing.T) {
-	clearAIEnv(t)
+	clearEnv(t)
 	path := writeTempConfig(t, `
 auth:
   credentials:
@@ -140,7 +141,7 @@ auth:
 }
 
 func TestEmptyCredentialsFallsBackToBuiltin(t *testing.T) {
-	clearAIEnv(t)
+	clearEnv(t)
 	path := writeTempConfig(t, `
 auth:
   credentials: {}
@@ -156,7 +157,7 @@ auth:
 }
 
 func TestAIEnvOverrides(t *testing.T) {
-	clearAIEnv(t)
+	clearEnv(t)
 	t.Setenv("AI_ENABLED", "yes")
 	t.Setenv("AI_BASE_URL", "http://127.0.0.1:8000")
 	t.Setenv("AI_API_KEY", "secret")
@@ -185,7 +186,7 @@ func TestAIEnvOverrides(t *testing.T) {
 }
 
 func TestAIEnvInvalidValuesKeepConfig(t *testing.T) {
-	clearAIEnv(t)
+	clearEnv(t)
 	t.Setenv("AI_ENABLED", "maybe")
 	t.Setenv("AI_TIMEOUT_SECONDS", "abc")
 
@@ -202,7 +203,7 @@ func TestAIEnvInvalidValuesKeepConfig(t *testing.T) {
 }
 
 func TestEmptyAIEnvIgnored(t *testing.T) {
-	clearAIEnv(t)
+	clearEnv(t)
 	t.Setenv("AI_MODEL_NAME", "   ")
 
 	cfg, err := Load(writeTempConfig(t, "ai:\n  model_name: from-file\n"), nil)
@@ -245,7 +246,7 @@ func TestLooksLikeContainerID(t *testing.T) {
 }
 
 func TestNormalizeAuth(t *testing.T) {
-	clearAIEnv(t)
+	clearEnv(t)
 	cfg, err := Load(writeTempConfig(t, `
 auth:
   maxFailures: 0
@@ -259,5 +260,63 @@ auth:
 	}
 	if cfg.Auth.MaxFailures != 3 || cfg.Auth.WindowMinutes != 5 || cfg.Auth.LockMinutes != 30 {
 		t.Errorf("非法认证参数应回退默认值, got %+v", cfg.Auth)
+	}
+}
+
+func TestWebTrustedProxiesEnvOverride(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("WEB_TRUSTED_PROXIES", "172.19.0.1, 172.18.0.0/16 ,")
+
+	cfg, err := Load(writeTempConfig(t, "web:\n  trustedProxies: [\"127.0.0.1\"]\n"), nil)
+	if err != nil {
+		t.Fatalf("加载失败: %v", err)
+	}
+	want := []string{"172.19.0.1", "172.18.0.0/16"}
+	if len(cfg.Web.TrustedProxies) != len(want) {
+		t.Fatalf("环境变量应整体覆盖配置文件取值: got %v", cfg.Web.TrustedProxies)
+	}
+	for i, w := range want {
+		if cfg.Web.TrustedProxies[i] != w {
+			t.Errorf("TrustedProxies[%d] = %q, want %q", i, cfg.Web.TrustedProxies[i], w)
+		}
+	}
+}
+
+func TestWebTrustedProxiesEnvPartialInvalid(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("WEB_TRUSTED_PROXIES", "10.0.0.0/8,not-an-ip")
+
+	cfg, err := Load(writeTempConfig(t, ""), nil)
+	if err != nil {
+		t.Fatalf("加载失败: %v", err)
+	}
+	if len(cfg.Web.TrustedProxies) != 1 || cfg.Web.TrustedProxies[0] != "10.0.0.0/8" {
+		t.Errorf("非法条目应忽略、合法条目保留: got %v", cfg.Web.TrustedProxies)
+	}
+}
+
+func TestWebTrustedProxiesEnvAllInvalidKeepsFile(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("WEB_TRUSTED_PROXIES", "garbage")
+
+	cfg, err := Load(writeTempConfig(t, "web:\n  trustedProxies: [\"127.0.0.1\"]\n"), nil)
+	if err != nil {
+		t.Fatalf("加载失败: %v", err)
+	}
+	if len(cfg.Web.TrustedProxies) != 1 || cfg.Web.TrustedProxies[0] != "127.0.0.1" {
+		t.Errorf("全部非法时应保留配置文件取值: got %v", cfg.Web.TrustedProxies)
+	}
+}
+
+func TestWebTrustedProxiesEnvEmptyIgnored(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("WEB_TRUSTED_PROXIES", "   ")
+
+	cfg, err := Load(writeTempConfig(t, "web:\n  trustedProxies: [\"127.0.0.1\"]\n"), nil)
+	if err != nil {
+		t.Fatalf("加载失败: %v", err)
+	}
+	if len(cfg.Web.TrustedProxies) != 1 || cfg.Web.TrustedProxies[0] != "127.0.0.1" {
+		t.Errorf("空白环境变量不应覆盖配置文件: got %v", cfg.Web.TrustedProxies)
 	}
 }

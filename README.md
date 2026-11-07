@@ -51,6 +51,7 @@ services:
     environment:
       - TZ=Asia/Shanghai
       - WEB_ADMIN_PASSWORD=        # 显式指定初始口令，优先级高于随机生成
+      - WEB_TRUSTED_PROXIES=       # 受信反向代理网段（逗号分隔），前置 Nginx 时用于还原真实来源 IP
       - AI_ENABLED=false
       - AI_BASE_URL=http://127.0.0.1:8000/v1
       - AI_API_KEY=abcdefg1234567890
@@ -114,7 +115,7 @@ go build -trimpath -buildvcs=false -o honeypot ./cmd/honeypot
 | `mysql` | `enabled`,`port` | `true`,`3306` |
 | `postgresql` | `enabled`,`port` | `true`,`5432` |
 | `redis` | `enabled`,`port` | `true`,`6379` |
-| `web` | `enabled`,`port`,`sessionTimeoutMinutes` | `true`,`8080`,`30` |
+| `web` | `enabled`,`port`,`sessionTimeoutMinutes`,`trustedProxies` | `true`,`8080`,`30`、空（不信任任何转发头） |
 | `log` | `file`,`db` | `logs/honeypot.jsonl`、`db/database.db` |
 | `auth` | `maxFailures`,`windowMinutes`,`lockMinutes`,`credentials` | `3`,`5`,`60`、内置弱口令本 |
 
@@ -155,6 +156,19 @@ mysql -h127.0.0.1 -P3306 -uroot -p                      # 捕获凭证后返回 
   关键字 / 时间范围过滤）；系统用户管理；操作审计（敏感字段已脱敏）
 - 角色：`admin`（全部权限）、`viewer`（仅查看）
 - 连续 5 次登录失败锁定来源 IP 15 分钟，请求体上限 1MB
+- 前置 Nginx 等反向代理时，默认不采信任何转发头，审计与登录锁定会把所有请求记为代理地址
+  （Docker 部署即容器内网段，如 `172.19.0.1`）；需配置 `web.trustedProxies`（或环境变量
+  `WEB_TRUSTED_PROXIES`，逗号分隔，优先级更高）为代理实际所在网段才会读取
+  `X-Forwarded-For` / `X-Real-IP` 还原真实 IP，白名单外的转发头一律忽略、无法伪造。
+  Nginx 侧需同步下发转发头：
+
+  ```nginx
+  location / {
+      proxy_pass http://127.0.0.1:8080;
+      proxy_set_header X-Real-IP $remote_addr;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+  }
+  ```
 - 建议 Web 端口仅对运维网段开放，不要直接暴露到公网
 
 ## AI 大模型命令仿真（可选）

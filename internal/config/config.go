@@ -5,6 +5,7 @@
 //   - 文件中未出现的键保留默认值（先构造默认结构体再反序列化）
 //   - credentials 兼容「单密码字符串」与「密码列表」两种写法
 //   - ai 段支持 AI_* 环境变量覆盖（存在且非空才生效）
+//   - web.trustedProxies 支持 WEB_TRUSTED_PROXIES 环境变量覆盖（逗号分隔）
 //   - 伪装主机名优先级：Docker 容器主机名 > 配置文件 hostname > 默认 svr01
 package config
 
@@ -12,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -226,6 +228,7 @@ func Load(path string, logger *slog.Logger) (*Config, error) {
 
 	cfg.normalizeAuth()
 	cfg.AI.applyEnvOverrides(logger)
+	cfg.Web.applyEnvOverrides(logger)
 	return cfg, nil
 }
 
@@ -339,6 +342,42 @@ func (a *AI) applyEnvOverrides(logger *slog.Logger) {
 	if len(applied) > 0 {
 		infof(logger, "AI 配置已按环境变量覆盖: %s", strings.Join(applied, ", "))
 	}
+}
+
+// applyEnvOverrides 按 WEB_TRUSTED_PROXIES 环境变量覆盖受信代理网段，
+// 优先级：环境变量（非空）> config.yaml > 默认值。
+// 值为逗号分隔的 CIDR 或裸 IP 列表（如 "172.19.0.1,172.18.0.0/16"），
+// 便于 Docker/compose 部署免挂载配置文件；非法条目告警并忽略，全部非法时保留原配置。
+func (w *Web) applyEnvOverrides(logger *slog.Logger) {
+	v := envValue("WEB_TRUSTED_PROXIES")
+	if v == "" {
+		return
+	}
+	var parsed, rejected []string
+	for _, part := range strings.Split(v, ",") {
+		s := strings.TrimSpace(part)
+		if s == "" {
+			continue
+		}
+		if _, _, err := net.ParseCIDR(s); err == nil {
+			parsed = append(parsed, s)
+			continue
+		}
+		if ip := net.ParseIP(strings.Trim(s, "[]")); ip != nil {
+			parsed = append(parsed, ip.String())
+			continue
+		}
+		rejected = append(rejected, s)
+	}
+	if len(rejected) > 0 {
+		warnf(logger, "环境变量 WEB_TRUSTED_PROXIES 含非法网段条目已忽略: %s", strings.Join(rejected, ", "))
+	}
+	if len(parsed) == 0 {
+		warnf(logger, "环境变量 WEB_TRUSTED_PROXIES=%s 无合法条目，保留配置文件取值。", v)
+		return
+	}
+	w.TrustedProxies = parsed
+	infof(logger, "Web 配置已按环境变量覆盖: WEB_TRUSTED_PROXIES=%s", strings.Join(parsed, ", "))
 }
 
 // envValue 取环境变量：未设置或空白视为未设置（避免 compose 传空值覆盖配置文件）。

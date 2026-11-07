@@ -63,6 +63,11 @@ web:
   # X-Forwarded-For / X-Real-IP 等转发头；留空（默认）表示不信任任何转发头，
   # 防止攻击者伪造来源 IP 绕过登录锁定或伪造审计来源。
   # 示例（Nginx 与本服务同机）：trustedProxies: ["127.0.0.1", "10.0.0.0/8"]
+  # Docker + Nginx 部署：直连地址是 Docker 网桥/网络网关（如 172.19.0.1），
+  # 需把 Nginx 所在网段加入白名单，否则来源 IP 全部记为容器内地址；
+  # 例：trustedProxies: ["172.16.0.0/12"]（覆盖全部 Docker 默认网段），
+  # 或精确到 Nginx 容器 IP / 所在子网；
+  # 也支持环境变量 WEB_TRUSTED_PROXIES（逗号分隔，优先级高于本键，免挂载配置文件）
   trustedProxies: []
 
 # 登录认证（密码本）配置：仅密码本内的 用户名/密码 允许登录

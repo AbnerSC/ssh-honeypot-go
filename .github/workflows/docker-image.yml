@@ -16,7 +16,7 @@
 # 推送目标：
 #   - Docker Hub（需在仓库 Settings -> Secrets 中配置：
 #       DOCKERHUB_USERNAME  Docker Hub 用户名
-#       DOCKERHUB_TOKEN     Docker Hub 访问令牌（Account Settings -> Security -> New Access Token））
+#       DOCKERHUB_TOKEN     Docker Hub 访问令牌（Account Settings -> Security -> New Access Token）
 # =====================================================================
 name: Docker 多架构镜像构建
 

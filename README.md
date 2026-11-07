@@ -215,6 +215,33 @@ jq -r 'select(.event=="auth_attempt") | [.ts,.src_ip,.username,.password] | @tsv
 - [x] Redis
 - [ ] HTTP（Nginx）
 
+## 功能截图
+<p>
+<img src="docs/ScreenShot_1.png" width="1200px" alt="攻击总览">
+</p>
+<p>
+<img src="docs/ScreenShot_2.png" width="1200px" alt="攻击总览">
+</p>
+<p>
+<img src="docs/ScreenShot_3.png" width="1200px" alt="会话记录">
+</p>
+<p>
+<img src="docs/ScreenShot_4.png" width="1200px" alt="登录尝试">
+</p>
+<p>
+<img src="docs/ScreenShot_5.png" width="1200px" alt="命令记录">
+</p>
+<p>
+<img src="docs/ScreenShot_6.png" width="1200px" alt="恶意下载">
+</p>
+<p>
+<img src="docs/ScreenShot_7.png" width="1200px" alt="IP锁定">
+</p>
+<p>
+<img src="docs/ScreenShot_8.png" width="1200px" alt="操作审计">
+</p>
+
+
 ## 加入群聊
 
 <p>

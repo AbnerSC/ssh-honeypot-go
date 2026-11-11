@@ -38,8 +38,10 @@
 #   - API_TOKEN_GITHUB  GitHub 凭据：Fine-grained PAT，对目标仓库授予
 #                        Contents: Read and write
 #                        配置位置：组织/仓库 Settings -> Actions -> Secrets
-#   - GITEA_API_TOKEN   Gitea 凭据：用户或组织 Token，仓库只读权限即可
-#                        （Release 为公开仓库时可留空，回退用 Actions 内置 token）
+#   - API_TOKEN_GITEA   Gitea 凭据：用户或组织 Token，仓库只读权限即可
+#                        （Release 为公开仓库时可留空，回退用 Actions 内置 token；
+#                        Gitea 已将 GITEA_ 开头的变量名列为其内置变量，用户不能
+#                        设置 GITEA_ 前缀的 secrets/vars，故不能用 GITEA_API_TOKEN）
 #   两者都写成 `secrets.X || vars.X`：Secret 优先（日志中会掩码，推荐），
 #   实例级全局变量也能用（Gitea 仅支持全局 variables、不支持全局 secrets，
 #   且全局变量对本实例所有仓库可见、日志不掩码，仅在无法使用 Secret 时退而求其次）
@@ -143,7 +145,7 @@ jobs:
           # 凭据：Secret 优先，回退实例级全局变量；
           # Gitea Token 再兜底一层 Actions 内置 token（公开仓库够用）
           GH_TOKEN: ${{ secrets.API_TOKEN_GITHUB || vars.API_TOKEN_GITHUB }}
-          GITEA_TOKEN_CFG: ${{ secrets.GITEA_API_TOKEN || vars.GITEA_API_TOKEN }}
+          GITEA_TOKEN_CFG: ${{ secrets.API_TOKEN_GITEA || vars.API_TOKEN_GITEA }}
           GITEA_TOKEN_BUILTIN: ${{ secrets.GITHUB_TOKEN }}
           # 二进制附件等待策略（由 release-build.yml 产出，见下面 1.5）
           SYNC_WAIT_SECONDS: ${{ vars.SYNC_ASSET_WAIT_SECONDS }}
@@ -166,7 +168,7 @@ jobs:
           [[ -n "${GH_TOKEN:-}" ]] \
             || err "未配置 GitHub 凭据：请在 Gitea 的 Actions Secrets 中新增 API_TOKEN_GITHUB（GitHub Fine-grained PAT，Contents 读写）"
           [[ -n "$GITEA_TOKEN" ]] \
-            || err "未配置 Gitea 凭据：请新增 GITEA_API_TOKEN（Token 权限：仓库只读）"
+            || err "未配置 Gitea 凭据：请新增 API_TOKEN_GITEA（Token 权限：仓库只读）"
 
           # 请求头数组：GitHub 用 Bearer，Gitea 用 token
           GH_HDR=(-H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json")

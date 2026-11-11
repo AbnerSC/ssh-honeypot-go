@@ -33,10 +33,13 @@
 #   本文件合入之前发布的版本不会自动触发，需手动运行补产物
 #
 # 前置条件（凭据一律配在 Gitea 侧，不要写进本文件）：
-#   - GITEA_API_TOKEN  Gitea Token：需要「内容写入（Contents: Write）」权限
+#   - API_TOKEN_GITEA  Gitea Token：需要「内容写入（Contents: Write）」权限
 #                      （上传 Release 附件属写操作；与 sync 工作流共用同一变量名，
 #                      sync 只读即可，但本工作流必须给到读写）
 #                      配置位置：组织/仓库 Settings -> Actions -> Secrets
+#                      命名注意：Gitea 已将 GITEA_ 开头的变量名列为其内置变量，
+#                      用户不能设置 GITEA_ 前缀的 secrets/vars，故不能用
+#                      GITEA_API_TOKEN 这种名字
 #                      写成 `secrets.X || vars.X`：Secret 优先（日志掩码），
 #                      实例级全局变量兜底（本实例所有仓库可见、日志不掩码）
 #   - 可选全局变量（不配则用下面 env 的默认值）：
@@ -134,7 +137,7 @@ jobs:
           GITEA_REPO: ${{ github.repository }}
           GITEA_SERVER_URL: ${{ github.server_url }}
           # 仅「手动触发且未填 tag」时才会用到（取最新发布版本），只读权限足够
-          GITEA_TOKEN_CFG: ${{ secrets.GITEA_API_TOKEN || vars.GITEA_API_TOKEN }}
+          GITEA_TOKEN_CFG: ${{ secrets.API_TOKEN_GITEA || vars.API_TOKEN_GITEA }}
           GITEA_TOKEN_BUILTIN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
@@ -152,7 +155,7 @@ jobs:
           fi
 
           if [[ -z "${RAW_TAG// }" ]]; then
-            [[ -n "$GITEA_TOKEN" ]] || err "未指定版本且未配置 GITEA_API_TOKEN，无法取最新发布版本"
+            [[ -n "$GITEA_TOKEN" ]] || err "未指定版本且未配置 API_TOKEN_GITEA，无法取最新发布版本"
             code=$(curl -sS --retry 3 --retry-delay 2 -o /tmp/latest.json -w '%{http_code}' \
                     -H "Authorization: token $GITEA_TOKEN" \
                     "$GITEA_API/repos/$GITEA_REPO/releases/latest") \
@@ -251,7 +254,7 @@ jobs:
           GITEA_REPO: ${{ github.repository }}
           GITEA_SERVER_URL: ${{ github.server_url }}
           # 上传附件是写操作，必须是「内容读写」权限的 Token（不回退到内置 token）
-          GITEA_TOKEN: ${{ secrets.GITEA_API_TOKEN || vars.GITEA_API_TOKEN }}
+          GITEA_TOKEN: ${{ secrets.API_TOKEN_GITEA || vars.API_TOKEN_GITEA }}
           FORCE_REUPLOAD: ${{ github.event.inputs.force_reupload }}
         run: |
           set -euo pipefail
@@ -262,7 +265,7 @@ jobs:
           GITEA_API="${GITEA_API_BASE:-${GITEA_SERVER_URL%/}/api/v1}"
           GITEA_API="${GITEA_API%/}"
           [[ -n "${GITEA_TOKEN:-}" ]] \
-            || err "未配置 GITEA_API_TOKEN：上传 Release 附件需要「内容读写」权限的 Gitea Token（配到 Settings -> Actions -> Secrets）"
+            || err "未配置 API_TOKEN_GITEA：上传 Release 附件需要「内容读写」权限的 Gitea Token（配到 Settings -> Actions -> Secrets）"
           # 自动触发（release 事件）没有 inputs，同名附件一律删除重传，保证重跑幂等
           FORCE="${FORCE_REUPLOAD:-true}"
           [[ "$FORCE" == "true" || "$FORCE" == "false" ]] || err "force_reupload 只能填 true 或 false，当前为：$FORCE"

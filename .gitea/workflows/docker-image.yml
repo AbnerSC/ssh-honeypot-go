@@ -127,7 +127,7 @@ jobs:
     needs: verify-image
     # PR 不推送镜像，仅由 verify-image 提供构建与身份校验
     if: github.event_name != 'pull_request'
-    runs-on: golang
+    runs-on: base
     timeout-minutes: 60
     steps:
       - name: 检出代码

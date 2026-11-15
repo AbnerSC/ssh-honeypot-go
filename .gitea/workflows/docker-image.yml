@@ -54,7 +54,7 @@ jobs:
   # 构建一份本地镜像验证运行身份，失败则阻断推送
   verify-image:
     name: 构建镜像并校验非 root 运行
-    runs-on: golang
+    runs-on: base
     timeout-minutes: 40
     steps:
       - name: 检出代码
